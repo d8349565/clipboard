@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+import os
+import sys
+
+import win32con
+
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
+
+from .hotkeys import HotkeySpec, parse_hotkey_sequence
+from .models import ClipboardItem
+from .persistence import SQLiteHistoryStore
+from .settings import AppSettings, default_db_path, load_settings, save_settings
+from .set_clipboard import set_clipboard_item
+from .store import ClipboardHistory
+from .ui_panel import ClipPanel
+from .ui_settings import SettingsDialog
+from .win_listener import ClipboardListener, HotkeyEvent
+
+
+HOTKEY_TOGGLE_PANEL = 1
+HOTKEY_TOGGLE_PAUSE = 2
+HOTKEY_TEST_PANEL = 101
+HOTKEY_TEST_PAUSE = 102
+
+
+class _Bridge(QObject):
+    event = Signal(object)
+
+
+class ClipHistApp:
+    def __init__(self) -> None:
+        self.qt_app = QApplication(sys.argv)
+        self.qt_app.setQuitOnLastWindowClosed(False)
+
+        self.settings = load_settings()
+        self.paused = False
+        self.history = ClipboardHistory(max_items=self.settings.max_items)
+        self._store: SQLiteHistoryStore | None = None
+
+        self.hotkey_show_hint: str | None = None
+        self.hotkey_pause_hint: str | None = None
+        self._hotkey_specs: dict[int, HotkeySpec] = {}
+
+        self.tray = QSystemTrayIcon(self._default_icon(), self.qt_app)
+        self.tray.setToolTip("ClipHist")
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.setContextMenu(self._build_tray_menu())
+        self.tray.show()
+
+        self.panel = ClipPanel(
+            on_activate=self._activate_item,
+            on_clear=self._clear_history,
+            on_open_settings=self._open_settings,
+        )
+
+        self._bridge = _Bridge()
+        self._bridge.event.connect(self._handle_event)
+
+        self.listener = ClipboardListener(on_event=self._bridge.event.emit)
+        self.listener.start()
+        if not self.listener.wait_ready(2.0):
+            raise RuntimeError("clipboard listener not ready")
+
+        self._register_hotkeys_with_fallback()
+
+        if self.settings.persist_enabled:
+            self._enable_persistence(True)
+        self._sync_ui_state()
+
+    def _default_icon(self) -> QIcon:
+        return self.qt_app.style().standardIcon(QStyle.SP_FileDialogDetailedView)
+
+    def _build_tray_menu(self) -> QMenu:
+        menu = QMenu()
+
+        act_open = QAction("打开面板", menu)
+        act_open.triggered.connect(self._open_panel)
+        menu.addAction(act_open)
+
+        act_settings = QAction("设置…", menu)
+        act_settings.triggered.connect(self._open_settings)
+        menu.addAction(act_settings)
+
+        self._act_pause = QAction("暂停监听", menu)
+        self._act_pause.setCheckable(True)
+        self._act_pause.triggered.connect(lambda checked: self._set_paused(bool(checked)))
+        menu.addAction(self._act_pause)
+
+        self._act_persist = QAction("启用持久化", menu)
+        self._act_persist.setCheckable(True)
+        self._act_persist.triggered.connect(lambda checked: self._enable_persistence(bool(checked)))
+        menu.addAction(self._act_persist)
+
+        act_clear = QAction("清空历史", menu)
+        act_clear.triggered.connect(self._clear_history)
+        menu.addAction(act_clear)
+
+        menu.addSeparator()
+
+        act_exit = QAction("退出", menu)
+        act_exit.triggered.connect(self.quit)
+        menu.addAction(act_exit)
+
+        return menu
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.Trigger:
+            self._open_panel()
+
+    def _open_panel(self) -> None:
+        self.panel.set_items(self.history.items())
+        self.panel.toggle_visible()
+
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self.settings, self._apply_hotkeys, parent=None)
+        dlg.exec()
+
+    def _handle_event(self, evt: object) -> None:
+        if isinstance(evt, HotkeyEvent):
+            if evt.hotkey_id == HOTKEY_TOGGLE_PANEL:
+                self._open_panel()
+            elif evt.hotkey_id == HOTKEY_TOGGLE_PAUSE:
+                self._set_paused(not self.paused)
+            return
+
+        if isinstance(evt, ClipboardItem):
+            if self.paused:
+                return
+            added = self.history.add(evt)
+            if added and self.panel.isVisible():
+                self.panel.set_items(self.history.items())
+            if added and self._store is not None:
+                try:
+                    self._store.insert(evt)
+                    self._store.trim_to_limit(self.history.max_items)
+                except Exception:
+                    pass
+
+    def _activate_item(self, item: ClipboardItem) -> None:
+        set_clipboard_item(item, hwnd=self.listener.hwnd)
+
+    def _set_paused(self, paused: bool) -> None:
+        if self.paused == paused:
+            return
+        self.paused = paused
+        self._sync_ui_state()
+
+    def _clear_history(self) -> None:
+        self.history.clear()
+        if self._store is not None:
+            try:
+                self._store.clear()
+            except Exception:
+                pass
+        if self.panel.isVisible():
+            self.panel.set_items(self.history.items())
+
+    def _enable_persistence(self, enabled: bool) -> None:
+        if enabled and self._store is None:
+            db_path = self.settings.db_path or default_db_path()
+            try:
+                os.makedirs(os.path.dirname(db_path), exist_ok=True)
+                self._store = SQLiteHistoryStore(db_path)
+                loaded = self._store.load_recent(self.history.max_items)
+                for it in reversed(loaded):
+                    self.history.add(it)
+            except Exception:
+                self._store = None
+                enabled = False
+        elif not enabled and self._store is not None:
+            try:
+                self._store.close()
+            except Exception:
+                pass
+            self._store = None
+
+        self.settings = AppSettings(
+            max_items=self.settings.max_items,
+            persist_enabled=enabled,
+            db_path=self.settings.db_path,
+            hotkey_show_panel=self.settings.hotkey_show_panel,
+            hotkey_toggle_pause=self.settings.hotkey_toggle_pause,
+        )
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+        if self.panel.isVisible():
+            self.panel.set_items(self.history.items())
+        self._sync_ui_state()
+
+    def _sync_ui_state(self) -> None:
+        try:
+            self._act_pause.setChecked(self.paused)
+        except Exception:
+            pass
+        try:
+            self._act_persist.setChecked(self._store is not None)
+        except Exception:
+            pass
+
+        self.panel.set_paused(self.paused)
+
+        show_hint = self.hotkey_show_hint or "(无)"
+        pause_hint = self.hotkey_pause_hint or "(无)"
+        hint = f"面板: {show_hint}\n暂停: {pause_hint}"
+        persist = "持久化: 开" if self._store is not None else "持久化: 关"
+        tip = "ClipHist\n" + hint + ("\n状态: 暂停" if self.paused else "\n状态: 监听中") + f"\n{persist}"
+        try:
+            self.tray.setToolTip(tip)
+        except Exception:
+            pass
+
+    def _register_hotkeys_with_fallback(self) -> None:
+        ok, _ = self._apply_hotkeys(self.settings.hotkey_show_panel, self.settings.hotkey_toggle_pause, save=False)
+        if ok:
+            return
+        ok, _ = self._apply_hotkeys(self.settings.hotkey_show_panel, "", save=False)
+        if ok:
+            return
+
+        candidates = [
+            ("Ctrl+Shift+V", "Ctrl+Shift+P"),
+            ("Ctrl+Alt+V", "Ctrl+Alt+P"),
+        ]
+        for show_seq, pause_seq in candidates:
+            ok, _ = self._apply_hotkeys(show_seq, pause_seq, save=False)
+            if ok:
+                return
+            ok, _ = self._apply_hotkeys(show_seq, "", save=False)
+            if ok:
+                return
+
+        try:
+            self.tray.showMessage(
+                "ClipHist",
+                "全局热键注册失败（可能被其他程序占用），可通过托盘打开面板。",
+                QSystemTrayIcon.Warning,
+                5000,
+            )
+        except Exception:
+            pass
+
+    def _apply_hotkeys(self, show_seq: str, pause_seq: str, save: bool = True) -> tuple[bool, str | None]:
+        show_seq = (show_seq or "").strip()
+        pause_seq = (pause_seq or "").strip()
+
+        show_spec = parse_hotkey_sequence(show_seq) if show_seq else None
+        pause_spec = parse_hotkey_sequence(pause_seq) if pause_seq else None
+
+        if show_seq and show_spec is None:
+            return False, "面板热键格式不支持"
+        if pause_seq and pause_spec is None:
+            return False, "暂停热键格式不支持"
+        if show_spec and pause_spec and (show_spec.modifiers, show_spec.vk) == (pause_spec.modifiers, pause_spec.vk):
+            return False, "两个功能不能设置为相同热键"
+
+        if show_spec is not None:
+            self.listener.unregister_hotkey(HOTKEY_TEST_PANEL)
+            ok, err = self.listener.register_hotkey_with_error(HOTKEY_TEST_PANEL, show_spec.modifiers, show_spec.vk)
+            self.listener.unregister_hotkey(HOTKEY_TEST_PANEL)
+            if not ok:
+                return False, self._format_hotkey_error("面板", err)
+        warn: str | None = None
+        if pause_spec is not None:
+            self.listener.unregister_hotkey(HOTKEY_TEST_PAUSE)
+            ok, err = self.listener.register_hotkey_with_error(HOTKEY_TEST_PAUSE, pause_spec.modifiers, pause_spec.vk)
+            self.listener.unregister_hotkey(HOTKEY_TEST_PAUSE)
+            if not ok:
+                warn = self._format_hotkey_error("暂停", err) + "，已禁用暂停热键"
+                pause_spec = None
+                pause_seq = ""
+
+        self.listener.unregister_hotkey(HOTKEY_TOGGLE_PANEL)
+        self.listener.unregister_hotkey(HOTKEY_TOGGLE_PAUSE)
+        self._hotkey_specs.pop(HOTKEY_TOGGLE_PANEL, None)
+        self._hotkey_specs.pop(HOTKEY_TOGGLE_PAUSE, None)
+
+        if show_spec is not None:
+            ok, err = self.listener.register_hotkey_with_error(HOTKEY_TOGGLE_PANEL, show_spec.modifiers, show_spec.vk)
+            if not ok:
+                return False, self._format_hotkey_error("面板", err)
+            self._hotkey_specs[HOTKEY_TOGGLE_PANEL] = show_spec
+            self.hotkey_show_hint = show_spec.display
+        else:
+            self.hotkey_show_hint = None
+
+        if pause_spec is not None:
+            ok, err = self.listener.register_hotkey_with_error(HOTKEY_TOGGLE_PAUSE, pause_spec.modifiers, pause_spec.vk)
+            if not ok:
+                warn = self._format_hotkey_error("暂停", err) + "，已禁用暂停热键"
+                pause_spec = None
+                pause_seq = ""
+        if pause_spec is not None:
+            self._hotkey_specs[HOTKEY_TOGGLE_PAUSE] = pause_spec
+            self.hotkey_pause_hint = pause_spec.display
+        else:
+            self.hotkey_pause_hint = None
+
+        if save:
+            self.settings = AppSettings(
+                max_items=self.settings.max_items,
+                persist_enabled=self.settings.persist_enabled,
+                db_path=self.settings.db_path,
+                hotkey_show_panel=show_seq,
+                hotkey_toggle_pause=pause_seq,
+            )
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
+
+        self._sync_ui_state()
+        return True, warn
+
+    def _format_hotkey_error(self, name: str, err: int) -> str:
+        if err == 1409:
+            return f"{name}热键注册失败：已被其他程序占用（错误码 {err}）"
+        if err == 1408:
+            return f"{name}热键注册失败：窗口属于其他线程（错误码 {err}）"
+        if err == 1400:
+            return f"{name}热键注册失败：窗口句柄无效（错误码 {err}）"
+        if err:
+            return f"{name}热键注册失败（错误码 {err}）"
+        return f"{name}热键注册失败"
+
+    def run(self) -> int:
+        try:
+            return self.qt_app.exec()
+        finally:
+            self.quit()
+
+    def quit(self) -> None:
+        try:
+            self.listener.stop()
+        except Exception:
+            pass
+        try:
+            if self._store is not None:
+                self._store.close()
+        except Exception:
+            pass
+        try:
+            self.tray.hide()
+        except Exception:
+            pass
+        try:
+            self.qt_app.quit()
+        except Exception:
+            pass

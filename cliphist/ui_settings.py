@@ -69,8 +69,8 @@ class SettingsDialog(QDialog):
         self._hotkey_pause.setKeySequence(QKeySequence("Ctrl+Shift+P"))
 
     def _on_ok(self) -> None:
-        show_seq = self._hotkey_show.keySequence().toString(QKeySequence.NativeText).strip()
-        pause_seq = self._hotkey_pause.keySequence().toString(QKeySequence.NativeText).strip()
+        show_seq = self._hotkey_show.keySequence().toString(QKeySequence.PortableText).strip()
+        pause_seq = self._hotkey_pause.keySequence().toString(QKeySequence.PortableText).strip()
         if show_seq == "None":
             show_seq = ""
         if pause_seq == "None":
@@ -80,4 +80,6 @@ class SettingsDialog(QDialog):
         if not ok:
             QMessageBox.warning(self, "设置", msg or "保存失败")
             return
+        if msg:
+            QMessageBox.information(self, "设置", msg)
         self.accept()

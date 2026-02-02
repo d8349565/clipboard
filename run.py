@@ -1,8 +1,10 @@
+import os
 import sys
 
 
 def _load_app():
     try:
+        os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.window=false")
         from cliphist.qt_app import ClipHistApp
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", "") or ""
