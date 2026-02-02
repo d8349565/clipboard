@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
+from .favorites import FavoritesStore
 from .hotkeys import HotkeySpec, parse_hotkey_sequence
 from .models import ClipboardItem
 from .persistence import SQLiteHistoryStore
@@ -39,6 +40,8 @@ class ClipHistApp:
         self.paused = False
         self.history = ClipboardHistory(max_items=self.settings.max_items)
         self._store: SQLiteHistoryStore | None = None
+        self.favorites = FavoritesStore()
+        self.favorites.load()
 
         self.hotkey_show_hint: str | None = None
         self.hotkey_pause_hint: str | None = None
@@ -54,6 +57,10 @@ class ClipHistApp:
             on_activate=self._activate_item,
             on_clear=self._clear_history,
             on_open_settings=self._open_settings,
+            get_favorites=self._get_favorites,
+            toggle_favorite=self._toggle_favorite,
+            remove_favorite=self._remove_favorite,
+            reorder_favorites=self._reorder_favorites,
         )
 
         self._bridge = _Bridge()
@@ -112,6 +119,7 @@ class ClipHistApp:
 
     def _open_panel(self) -> None:
         self.panel.set_items(self.history.items())
+        self.panel.set_favorites(self._get_favorites())
         self.panel.toggle_visible()
 
     def _open_settings(self) -> None:
@@ -132,6 +140,7 @@ class ClipHistApp:
             added = self.history.add(evt)
             if added and self.panel.isVisible():
                 self.panel.set_items(self.history.items())
+                self.panel.set_favorites(self._get_favorites())
             if added and self._store is not None:
                 try:
                     self._store.insert(evt)
@@ -157,6 +166,40 @@ class ClipHistApp:
                 pass
         if self.panel.isVisible():
             self.panel.set_items(self.history.items())
+            self.panel.set_favorites(self._get_favorites())
+
+    def _get_favorites(self) -> list[tuple[str, ClipboardItem]]:
+        return [(e.fav_id, e.item) for e in self.favorites.entries]
+
+    def _toggle_favorite(self, item: ClipboardItem) -> tuple[bool, str | None]:
+        is_now_fav, _ = self.favorites.toggle(item)
+        try:
+            self.favorites.save()
+        except Exception:
+            pass
+        if self.panel.isVisible():
+            self.panel.set_favorites(self._get_favorites())
+        return True, None
+
+    def _remove_favorite(self, fav_id: str) -> tuple[bool, str | None]:
+        self.favorites.remove_by_id(fav_id)
+        try:
+            self.favorites.save()
+        except Exception:
+            pass
+        if self.panel.isVisible():
+            self.panel.set_favorites(self._get_favorites())
+        return True, None
+
+    def _reorder_favorites(self, fav_ids_in_order: list[str]) -> tuple[bool, str | None]:
+        self.favorites.set_order(fav_ids_in_order)
+        try:
+            self.favorites.save()
+        except Exception:
+            pass
+        if self.panel.isVisible():
+            self.panel.set_favorites(self._get_favorites())
+        return True, None
 
     def _enable_persistence(self, enabled: bool) -> None:
         if enabled and self._store is None:
