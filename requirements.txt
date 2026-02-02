@@ -1,0 +1,4 @@
+PySide6>=6.6
+pywin32>=306
+pillow>=10.0
+pytest>=8.0
