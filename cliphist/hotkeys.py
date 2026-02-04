@@ -59,11 +59,11 @@ def parse_hotkey_sequence(seq: str) -> HotkeySpec | None:
         return None
 
     seq = seq.strip()
-    for sep in (",", "，"):
+    for sep in (",", "，", "、"):
         if sep in seq:
             seq = seq.split(sep, 1)[0].strip()
             break
-    seq = seq.replace("＋", "+")
+    seq = seq.replace("＋", "+").replace("﹢", "+")
     parts = [p.strip() for p in seq.replace(" ", "").split("+") if p.strip()]
     if not parts:
         return None

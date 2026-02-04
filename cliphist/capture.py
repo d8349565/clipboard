@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import html as _html
+import re
 import time
 from typing import Final
 
@@ -12,6 +14,10 @@ from .models import ClipboardItem
 
 HTML_FORMAT_NAME: Final[str] = "HTML Format"
 RTF_FORMAT_NAME: Final[str] = "Rich Text Format"
+_RE_HTML_SCRIPT_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_RE_HTML_TAG = re.compile(r"<[^>]+>")
+_RE_RTF_CTRL = re.compile(r"\\[a-zA-Z]+\d* ?|[{}]")
+_RE_WS = re.compile(r"\s+")
 
 
 @contextmanager
@@ -102,6 +108,29 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
 
 
 def _extract_html_fragment_preview(raw: bytes, max_len: int = 400) -> str:
+    html_fragment = _extract_html_fragment(raw)
+    if html_fragment:
+        return _html_to_plain_text(html_fragment, max_len=max_len)
+    try:
+        s = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return "(HTML)"
+    plain = _html_to_plain_text(s, max_len=max_len)
+    return plain or "(HTML)"
+
+
+def _rtf_preview(raw: bytes, max_len: int = 400) -> str:
+    try:
+        s = raw.decode("latin-1", errors="ignore")
+    except Exception:
+        return "(RTF)"
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _RE_RTF_CTRL.sub(" ", s)
+    s = _RE_WS.sub(" ", s).strip()
+    return (s[:max_len] or "(RTF)")
+
+
+def _extract_html_fragment(raw: bytes) -> str:
     try:
         header = raw[:4096].decode("ascii", errors="ignore")
         start_key = "StartFragment:"
@@ -113,22 +142,24 @@ def _extract_html_fragment_preview(raw: bytes, max_len: int = 400) -> str:
             end_line = header[end_i : header.find("\n", end_i)].strip()
             start = int(start_line.split(":", 1)[1].strip())
             end = int(end_line.split(":", 1)[1].strip())
-            frag = raw[start:end]
-            s = frag.decode("utf-8", errors="ignore")
-            s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
-            return s[:max_len]
+            if 0 <= start < end <= len(raw):
+                return raw[start:end].decode("utf-8", errors="ignore")
     except Exception:
         pass
-    try:
-        s = raw.decode("utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip()
-        return s[:max_len]
-    except Exception:
-        return "(HTML)"
+    return ""
 
 
-def _rtf_preview(raw: bytes, max_len: int = 400) -> str:
-    try:
-        s = raw.decode("latin-1", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip()
-        return s[:max_len]
-    except Exception:
-        return "(RTF)"
+def _html_to_plain_text(s: str, max_len: int = 400) -> str:
+    if not s:
+        return ""
+    s = _RE_HTML_SCRIPT_STYLE.sub(" ", s)
+    s = _RE_HTML_TAG.sub(" ", s)
+    # Handle truncated HTML like "<ul style=..." where no closing ">" exists.
+    lt = s.rfind("<")
+    gt = s.rfind(">")
+    if lt > gt:
+        s = s[:lt]
+    s = _html.unescape(s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _RE_WS.sub(" ", s).strip()
+    return s[:max_len]

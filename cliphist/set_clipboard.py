@@ -6,6 +6,7 @@ import time
 import win32clipboard
 import win32con
 
+from .capture import _extract_html_fragment_preview, _rtf_preview
 from .models import ClipboardItem
 
 
@@ -57,14 +58,20 @@ def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
             fmt = win32clipboard.RegisterClipboardFormat(HTML_FORMAT_NAME)
             if item.raw_bytes:
                 win32clipboard.SetClipboardData(fmt, item.raw_bytes)
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, item.text or "")
+            plain_text = item.text or ""
+            if item.raw_bytes:
+                plain_text = _extract_html_fragment_preview(item.raw_bytes, max_len=12000) or plain_text
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain_text)
             return
 
         if item.item_type == "rtf":
             fmt = win32clipboard.RegisterClipboardFormat(RTF_FORMAT_NAME)
             if item.raw_bytes:
                 win32clipboard.SetClipboardData(fmt, item.raw_bytes)
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, item.text or "")
+            plain_text = item.text or ""
+            if item.raw_bytes:
+                plain_text = _rtf_preview(item.raw_bytes, max_len=12000) or plain_text
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain_text)
             return
 
         raise ValueError(f"unsupported item_type: {item.item_type}")

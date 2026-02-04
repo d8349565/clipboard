@@ -23,8 +23,6 @@ from .win_listener import ClipboardListener, HotkeyEvent
 
 HOTKEY_TOGGLE_PANEL = 1
 HOTKEY_TOGGLE_PAUSE = 2
-HOTKEY_TEST_PANEL = 101
-HOTKEY_TEST_PAUSE = 102
 
 
 class _Bridge(QObject):
@@ -269,19 +267,25 @@ class ClipHistApp:
         candidates = [
             ("Ctrl+Shift+V", "Ctrl+Shift+P"),
             ("Ctrl+Alt+V", "Ctrl+Alt+P"),
+            ("Alt+Shift+V", "Alt+Shift+P"),
+            ("Ctrl+Shift+F8", "Ctrl+Shift+F9"),
+            ("Ctrl+Alt+F8", "Ctrl+Alt+F9"),
+            ("Win+Alt+V", "Win+Alt+P"),
         ]
         for show_seq, pause_seq in candidates:
             ok, _ = self._apply_hotkeys(show_seq, pause_seq, save=False)
             if ok:
+                self._save_hotkey_settings(show_seq, pause_seq)
                 return
             ok, _ = self._apply_hotkeys(show_seq, "", save=False)
             if ok:
+                self._save_hotkey_settings(show_seq, "")
                 return
 
         try:
             self.tray.showMessage(
                 "ClipHist",
-                "全局热键注册失败（可能被其他程序占用），可通过托盘打开面板。",
+                "全局热键注册失败（可能被其他程序或另一个 ClipHist 占用），可通过托盘打开面板。",
                 QSystemTrayIcon.Warning,
                 5000,
             )
@@ -294,6 +298,8 @@ class ClipHistApp:
 
         show_spec = parse_hotkey_sequence(show_seq) if show_seq else None
         pause_spec = parse_hotkey_sequence(pause_seq) if pause_seq else None
+        prev_show_spec = self._hotkey_specs.get(HOTKEY_TOGGLE_PANEL)
+        prev_pause_spec = self._hotkey_specs.get(HOTKEY_TOGGLE_PAUSE)
 
         if show_seq and show_spec is None:
             return False, "面板热键格式不支持"
@@ -301,36 +307,29 @@ class ClipHistApp:
             return False, "暂停热键格式不支持"
         if show_spec and pause_spec and (show_spec.modifiers, show_spec.vk) == (pause_spec.modifiers, pause_spec.vk):
             return False, "两个功能不能设置为相同热键"
-
-        if show_spec is not None:
-            self.listener.unregister_hotkey(HOTKEY_TEST_PANEL)
-            ok, err = self.listener.register_hotkey_with_error(HOTKEY_TEST_PANEL, show_spec.modifiers, show_spec.vk)
-            self.listener.unregister_hotkey(HOTKEY_TEST_PANEL)
-            if not ok:
-                return False, self._format_hotkey_error("面板", err)
-        warn: str | None = None
-        if pause_spec is not None:
-            self.listener.unregister_hotkey(HOTKEY_TEST_PAUSE)
-            ok, err = self.listener.register_hotkey_with_error(HOTKEY_TEST_PAUSE, pause_spec.modifiers, pause_spec.vk)
-            self.listener.unregister_hotkey(HOTKEY_TEST_PAUSE)
-            if not ok:
-                warn = self._format_hotkey_error("暂停", err) + "，已禁用暂停热键"
-                pause_spec = None
-                pause_seq = ""
+        if show_spec == prev_show_spec and pause_spec == prev_pause_spec:
+            self.hotkey_show_hint = show_spec.display if show_spec is not None else None
+            self.hotkey_pause_hint = pause_spec.display if pause_spec is not None else None
+            if save:
+                self._save_hotkey_settings(show_seq, pause_seq)
+            self._sync_ui_state()
+            return True, None
 
         self.listener.unregister_hotkey(HOTKEY_TOGGLE_PANEL)
         self.listener.unregister_hotkey(HOTKEY_TOGGLE_PAUSE)
         self._hotkey_specs.pop(HOTKEY_TOGGLE_PANEL, None)
         self._hotkey_specs.pop(HOTKEY_TOGGLE_PAUSE, None)
+        self.hotkey_show_hint = None
+        self.hotkey_pause_hint = None
 
+        warn: str | None = None
         if show_spec is not None:
             ok, err = self.listener.register_hotkey_with_error(HOTKEY_TOGGLE_PANEL, show_spec.modifiers, show_spec.vk)
             if not ok:
+                self._restore_hotkeys(prev_show_spec, prev_pause_spec)
                 return False, self._format_hotkey_error("面板", err)
             self._hotkey_specs[HOTKEY_TOGGLE_PANEL] = show_spec
             self.hotkey_show_hint = show_spec.display
-        else:
-            self.hotkey_show_hint = None
 
         if pause_spec is not None:
             ok, err = self.listener.register_hotkey_with_error(HOTKEY_TOGGLE_PAUSE, pause_spec.modifiers, pause_spec.vk)
@@ -345,20 +344,42 @@ class ClipHistApp:
             self.hotkey_pause_hint = None
 
         if save:
-            self.settings = AppSettings(
-                max_items=self.settings.max_items,
-                persist_enabled=self.settings.persist_enabled,
-                db_path=self.settings.db_path,
-                hotkey_show_panel=show_seq,
-                hotkey_toggle_pause=pause_seq,
-            )
-            try:
-                save_settings(self.settings)
-            except Exception:
-                pass
+            self._save_hotkey_settings(show_seq, pause_seq)
 
         self._sync_ui_state()
         return True, warn
+
+    def _save_hotkey_settings(self, show_seq: str, pause_seq: str) -> None:
+        self.settings = AppSettings(
+            max_items=self.settings.max_items,
+            persist_enabled=self.settings.persist_enabled,
+            db_path=self.settings.db_path,
+            hotkey_show_panel=show_seq,
+            hotkey_toggle_pause=pause_seq,
+        )
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _restore_hotkeys(self, show_spec: HotkeySpec | None, pause_spec: HotkeySpec | None) -> None:
+        self.listener.unregister_hotkey(HOTKEY_TOGGLE_PANEL)
+        self.listener.unregister_hotkey(HOTKEY_TOGGLE_PAUSE)
+        self._hotkey_specs.pop(HOTKEY_TOGGLE_PANEL, None)
+        self._hotkey_specs.pop(HOTKEY_TOGGLE_PAUSE, None)
+        self.hotkey_show_hint = None
+        self.hotkey_pause_hint = None
+
+        if show_spec is not None:
+            ok, _ = self.listener.register_hotkey_with_error(HOTKEY_TOGGLE_PANEL, show_spec.modifiers, show_spec.vk)
+            if ok:
+                self._hotkey_specs[HOTKEY_TOGGLE_PANEL] = show_spec
+                self.hotkey_show_hint = show_spec.display
+        if pause_spec is not None:
+            ok, _ = self.listener.register_hotkey_with_error(HOTKEY_TOGGLE_PAUSE, pause_spec.modifiers, pause_spec.vk)
+            if ok:
+                self._hotkey_specs[HOTKEY_TOGGLE_PAUSE] = pause_spec
+                self.hotkey_pause_hint = pause_spec.display
 
     def _format_hotkey_error(self, name: str, err: int) -> str:
         if err == 1409:
