@@ -211,8 +211,8 @@ class SettingsDialog(QDialog):
         super().mouseReleaseEvent(event)
 
     def _reset_defaults(self) -> None:
-        self._hotkey_show.setKeySequence(QKeySequence("Ctrl+Shift+V"))
-        self._hotkey_pause.setKeySequence(QKeySequence("Ctrl+Shift+P"))
+        self._hotkey_show.setKeySequence(QKeySequence("Alt+C"))
+        self._hotkey_pause.setKeySequence(QKeySequence("Alt+P"))
 
     def _on_ok(self) -> None:
         show_seq = self._hotkey_show.keySequence().toString(QKeySequence.PortableText).strip()
@@ -226,6 +226,5 @@ class SettingsDialog(QDialog):
         if not ok:
             QMessageBox.warning(self, "设置", msg or "保存失败")
             return
-        if msg:
-            QMessageBox.information(self, "设置", msg)
+        # Successful apply should be silent even when optional hotkeys degrade.
         self.accept()

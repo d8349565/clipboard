@@ -16,8 +16,8 @@ class AppSettings:
     max_items: int = 200
     persist_enabled: bool = False
     db_path: str | None = None
-    hotkey_show_panel: str = "Ctrl+Shift+V"
-    hotkey_toggle_pause: str = "Ctrl+Shift+P"
+    hotkey_show_panel: str = "Alt+C"
+    hotkey_toggle_pause: str = "Alt+P"
 
 
 def default_app_dir() -> str:
@@ -47,8 +47,8 @@ def load_settings() -> AppSettings:
     max_items = min(max_items, MAX_ITEMS_LIMIT)
     persist_enabled = bool(data.get("persist_enabled", False))
     db_path = data.get("db_path") or None
-    hotkey_show_panel = str(data.get("hotkey_show_panel") or "Ctrl+Shift+V")
-    hotkey_toggle_pause = str(data.get("hotkey_toggle_pause") or "Ctrl+Shift+P")
+    hotkey_show_panel = str(data.get("hotkey_show_panel") or "Alt+C")
+    hotkey_toggle_pause = str(data.get("hotkey_toggle_pause") or "Alt+P")
     return AppSettings(
         max_items=max_items,
         persist_enabled=persist_enabled,
@@ -65,4 +65,3 @@ def save_settings(settings: AppSettings) -> None:
     data = asdict(settings)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-

@@ -263,6 +263,8 @@ class ClipHistApp:
             return
 
         candidates = [
+            ("Alt+C", "Alt+P"),
+            ("Alt+V", "Alt+P"),
             ("Ctrl+Shift+V", "Ctrl+Shift+P"),
             ("Ctrl+Alt+V", "Ctrl+Alt+P"),
             ("Alt+Shift+V", "Alt+Shift+P"),

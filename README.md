@@ -1,40 +1,76 @@
-# ClipHist（Windows 剪切板历史）
+# ClipHist 用户指南（Windows）
 
-## 功能
-- 实时监听剪切板变化并保存历史
-- 支持：文本、文件列表、图片（DIB）、HTML、RTF
-- 托盘常驻；热键或托盘打开面板
-- 面板支持：搜索、双击写回剪切板、拖拽输出到其他应用
+ClipHist 是一个剪切板历史工具。它会常驻托盘，自动记录你复制过的内容，方便随时找回并再次粘贴。
 
-## 运行
+## 1. 你可以用它做什么
+
+- 自动记录复制历史（文本、文件列表、图片、HTML、RTF）
+- 快速搜索历史内容
+- 双击一条记录，立即写回剪切板
+- 管理收藏（收藏、删除、排序）
+- 可选开启持久化，重启后历史仍保留
+
+## 2. 安装与启动
+
+在项目目录执行：
+
 ```powershell
 python -m pip install -r requirements.txt
 python run.py
 ```
 
-如果你有多个 Python（例如 conda/base、系统 Python、IDE 自带 Python），务必用同一个解释器安装依赖并运行，例如：
-```powershell
-D:/RUANJIAN/py/python.exe -m pip install -r requirements.txt
-D:/RUANJIAN/py/python.exe run.py
-```
+启动后程序会出现在系统托盘（右下角）。
 
-## 热键
-- 默认尝试 Ctrl+Shift+V（若冲突则尝试 Ctrl+Alt+V）；失败可用托盘打开面板
-- 默认尝试 Ctrl+Shift+P（或 Ctrl+Alt+P）切换“暂停监听”
+## 3. 默认快捷键
 
-## 数据与隐私
-- 默认不落盘（持久化关闭）
-- 托盘可开启“启用持久化”，数据保存到 %APPDATA%\\ClipHist\\history.sqlite3
-- 设置文件：%APPDATA%\\ClipHist\\config.json
+- 打开面板：`Alt+C`
+- 暂停/恢复监听：`Alt+P`
 
-## 打包（Windows）
-```powershell
-./build_windows.ps1
-```
-输出位于 `dist/ClipHist/ClipHist.exe`（由 PyInstaller 生成）。
+说明：
+- 如果某个热键被其他软件占用，ClipHist 会自动尝试可用组合。
+- 你也可以在“设置”里手动修改热键。
 
-## 测试
-```powershell
-python -m pip install pytest
-pytest -q
-```
+## 4. 日常使用
+
+1. 按 `Alt+C` 打开面板（或点击托盘图标）。
+2. 在搜索框输入关键字筛选历史。
+3. 双击某条记录，把内容放回剪切板。
+4. 去目标应用里直接粘贴（`Ctrl+V`）。
+
+## 5. 收藏与管理
+
+- 收藏/取消收藏：选中记录后点收藏按钮
+- 收藏页排序：在“收藏”页使用上下移动按钮
+- 删除收藏：在“收藏”页删除
+- 清空历史：点击清空按钮（仅清空历史，不会删除收藏）
+
+## 6. 设置项说明
+
+在面板中点击“设置”可修改：
+
+- 打开面板热键
+- 暂停监听热键
+
+热键规则：
+- 支持组合：`Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24/方向键`
+
+## 7. 数据保存位置
+
+- 配置文件：`%APPDATA%\ClipHist\config.json`
+- 收藏文件：`%APPDATA%\ClipHist\favorites.json`
+- 历史数据库（开启持久化后）：`%APPDATA%\ClipHist\history.sqlite3`
+
+## 8. 常见问题
+
+- 看不到历史变化：
+  - 确认没有处于“暂停监听”状态
+  - 某些应用会限制剪切板读取，属于系统/应用行为
+- 热键无反应：
+  - 可能与其他软件冲突，去“设置”换一组热键
+- 启动报依赖缺失：
+  - 重新执行：`python -m pip install -r requirements.txt`
+
+## 9. 退出程序
+
+- 在托盘菜单点击“退出”
+- 直接关闭面板窗口不会退出后台进程
