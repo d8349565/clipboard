@@ -36,6 +36,12 @@ from .text_util import (
     rtf_to_plain_text,
 )
 
+ROLE_ITEM = int(Qt.UserRole)
+ROLE_FAV_ID = int(Qt.UserRole + 1)
+ROLE_IS_FAVORITE = int(Qt.UserRole + 2)
+ROLE_TITLE = int(Qt.UserRole + 3)
+ROLE_SUBTITLE = int(Qt.UserRole + 4)
+
 
 class _ClipListWidget(QListWidget):
     def __init__(self, get_item: Callable[[int], ClipboardItem | None], parent: QWidget | None = None) -> None:
@@ -170,20 +176,61 @@ class _ClipItemDelegate(QStyledItemDelegate):
         "rtf": QColor("#EDE9FE"),
     }
     _DEFAULT_TYPE_COLOR = QColor("#E2E8F0")
+    _TYPE_SYMBOLS: dict[str, str] = {
+        "text": "T",
+        "files": "F",
+        "image": "I",
+        "html": "H",
+        "rtf": "R",
+    }
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._thumb_cache: dict[tuple, QPixmap] = {}
+        self._thumb_cache: dict[int, QPixmap] = {}
+        self._preview_cache: dict[int, str] = {}
+        self._secondary_cache: dict[int, str] = {}
+
+    def clear_caches(self) -> None:
+        """Clear text caches when items change."""
+        self._thumb_cache.clear()
+        self._preview_cache.clear()
+        self._secondary_cache.clear()
+
+    @staticmethod
+    def _cache_key(it: ClipboardItem) -> int:
+        # Avoid hashing large bytes payloads during paint (image/html/rtf items).
+        return id(it)
+
+    def _cached_preview(self, it: ClipboardItem, max_len: int = 150) -> str:
+        key = self._cache_key(it)
+        cached = self._preview_cache.get(key)
+        if cached is not None:
+            return cached
+        val = _clean_preview(it, max_len)
+        self._preview_cache[key] = val
+        if len(self._preview_cache) > 500:
+            self._preview_cache.pop(next(iter(self._preview_cache)))
+        return val
+
+    def _cached_secondary(self, it: ClipboardItem) -> str:
+        key = self._cache_key(it)
+        cached = self._secondary_cache.get(key)
+        if cached is not None:
+            return cached
+        val = _secondary_text(it)
+        self._secondary_cache[key] = val
+        if len(self._secondary_cache) > 500:
+            self._secondary_cache.pop(next(iter(self._secondary_cache)))
+        return val
 
     def paint(self, painter: QPainter, option, index):  # type: ignore[override]
-        it: ClipboardItem | None = index.data(Qt.UserRole)
+        it: ClipboardItem | None = index.data(ROLE_ITEM)
         if it is None:
             super().paint(painter, option, index)
             return
 
-        is_fav = bool(index.data(Qt.UserRole + 2))
+        is_fav = bool(index.data(ROLE_IS_FAVORITE))
         painter.save()
-        painter.setRenderHint(QPainter.Antialiasing, True)
         rect: QRect = option.rect
 
         is_selected = bool(option.state & QStyle.State_Selected)
@@ -219,9 +266,9 @@ class _ClipItemDelegate(QStyledItemDelegate):
                 painter.setPen(QColor(15, 23, 42, 40))
                 painter.drawRoundedRect(badge_rect.adjusted(0, 0, -1, -1), 8, 8)
             else:
-                self._paint_icon_badge(painter, badge_rect, it, is_selected, option.widget)
+                self._paint_icon_badge(painter, badge_rect, it, is_selected)
         else:
-            self._paint_icon_badge(painter, badge_rect, it, is_selected, option.widget)
+            self._paint_icon_badge(painter, badge_rect, it, is_selected)
 
         x0 = badge_rect.right() + 12
         x1 = rect.right() - 14 - 20
@@ -229,7 +276,9 @@ class _ClipItemDelegate(QStyledItemDelegate):
         y0 = rect.top() + 8
 
         fm1 = option.fontMetrics
-        title = _clean_preview(it, 150)
+        title = str(index.data(ROLE_TITLE) or "")
+        if not title:
+            title = self._cached_preview(it, 150)
         title = fm1.elidedText(title, Qt.ElideRight, w)
 
         font_title = option.font
@@ -238,7 +287,9 @@ class _ClipItemDelegate(QStyledItemDelegate):
         painter.setPen(fg)
         painter.drawText(QRect(x0, y0, w, fm1.height() + 2), Qt.AlignLeft | Qt.AlignVCenter, title)
 
-        subtitle = _secondary_text(it)
+        subtitle = str(index.data(ROLE_SUBTITLE) or "")
+        if not subtitle:
+            subtitle = self._cached_secondary(it)
         painter.setFont(option.font)
         painter.setPen(sub_fg)
         painter.drawText(
@@ -258,7 +309,7 @@ class _ClipItemDelegate(QStyledItemDelegate):
         return base.expandedTo(base.__class__(base.width(), 58))
 
     def _image_thumb(self, it: ClipboardItem, size: int) -> QPixmap | None:
-        key = it.dedupe_key()
+        key = self._cache_key(it)
         cached = self._thumb_cache.get(key)
         if cached is not None:
             return cached
@@ -277,33 +328,22 @@ class _ClipItemDelegate(QStyledItemDelegate):
         rect: QRect,
         it: ClipboardItem,
         is_selected: bool,
-        widget: QWidget | None,
     ) -> None:
         bg = QColor(255, 255, 255, 60) if is_selected else self._type_color(it.item_type)
-        painter.setPen(Qt.NoPen)
         painter.setBrush(bg)
+        painter.setPen(Qt.NoPen)
         painter.drawEllipse(rect)
-        icon = self._icon_for(it, widget)
-        icon_rect = rect.adjusted(7, 7, -7, -7)
-        icon.paint(painter, icon_rect, Qt.AlignCenter)
+
+        symbol = self._TYPE_SYMBOLS.get(it.item_type, "?")
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(8, font.pointSize() - 1))
+        painter.setFont(font)
+        painter.setPen(QColor("#0F172A") if not is_selected else QColor("#FFFFFF"))
+        painter.drawText(rect, Qt.AlignCenter, symbol)
 
     def _type_color(self, item_type: str) -> QColor:
         return self._TYPE_COLORS.get(item_type, self._DEFAULT_TYPE_COLOR)
-
-    def _icon_for(self, it: ClipboardItem, widget: QWidget | None):
-        w = widget or QWidget()
-        style = w.style()
-        if it.item_type == "text":
-            return style.standardIcon(QStyle.SP_FileIcon)
-        if it.item_type == "files":
-            return style.standardIcon(QStyle.SP_DirIcon)
-        if it.item_type == "image":
-            return style.standardIcon(QStyle.SP_FileDialogContentsView)
-        if it.item_type == "html":
-            return style.standardIcon(QStyle.SP_BrowserReload)
-        if it.item_type == "rtf":
-            return style.standardIcon(QStyle.SP_FileDialogInfoView)
-        return style.standardIcon(QStyle.SP_MessageBoxQuestion)
 
 
 class ClipPanel(QWidget):
@@ -330,7 +370,6 @@ class ClipPanel(QWidget):
         self._favorites: list[tuple[str, ClipboardItem]] = []
         self._fav_filtered: list[tuple[str, ClipboardItem]] = []
         self._paused = False
-        self._pinned = False
         self._drag_pos: QPoint | None = None
         self._hover_preview = True
 
@@ -360,7 +399,11 @@ class ClipPanel(QWidget):
 
         self._list_all = _ClipListWidget(self._get_filtered_item, card)
         self._list_all.setUniformItemSizes(True)
-        self._list_all.setItemDelegate(_ClipItemDelegate(self._list_all))
+        self._delegate_all = _ClipItemDelegate(self._list_all)
+        self._list_all.setItemDelegate(self._delegate_all)
+        self._list_all.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self._list_all.verticalScrollBar().setSingleStep(18)
+        self._list_all.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._list_all.itemActivated.connect(lambda _: self._activate_current())
         self._list_all.setMouseTracking(True)
         self._list_all.currentItemChanged.connect(lambda *_: self._update_preview())
@@ -371,7 +414,11 @@ class ClipPanel(QWidget):
 
         self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card)
         self._list_fav.setUniformItemSizes(True)
-        self._list_fav.setItemDelegate(_ClipItemDelegate(self._list_fav))
+        self._delegate_fav = _ClipItemDelegate(self._list_fav)
+        self._list_fav.setItemDelegate(self._delegate_fav)
+        self._list_fav.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self._list_fav.verticalScrollBar().setSingleStep(18)
+        self._list_fav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._list_fav.itemActivated.connect(lambda _: self._activate_current())
         self._list_fav.setMouseTracking(True)
         self._list_fav.currentItemChanged.connect(lambda *_: self._update_preview())
@@ -472,92 +519,112 @@ class ClipPanel(QWidget):
         popup_body.addWidget(self._popup_stack)
         self._popup_image_data: QImage | None = None
 
-        header = QHBoxLayout()
+        # ── Row 1: Title bar ──
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(8)
         self._title = QLabel("剪切板历史", card)
         self._title.setObjectName("title")
-        header.addWidget(self._title)
+        title_bar.addWidget(self._title)
 
         self._status = QLabel("", card)
         self._status.setObjectName("status")
-        header.addWidget(self._status)
+        title_bar.addWidget(self._status)
 
-        header.addStretch(1)
+        title_bar.addStretch(1)
+
+        self._btn_minimize = QToolButton(card)
+        self._btn_minimize.setObjectName("btnWinControl")
+        self._btn_minimize.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMinButton))
+        self._btn_minimize.setToolTip("最小化")
+        self._btn_minimize.setFixedSize(28, 28)
+        self._btn_minimize.clicked.connect(self.showMinimized)
+        title_bar.addWidget(self._btn_minimize)
+
+        self._btn_close = QToolButton(card)
+        self._btn_close.setObjectName("btnWinClose")
+        self._btn_close.setIcon(self.style().standardIcon(QStyle.SP_TitleBarCloseButton))
+        self._btn_close.setToolTip("关闭")
+        self._btn_close.setFixedSize(28, 28)
+        self._btn_close.clicked.connect(self.hide)
+        title_bar.addWidget(self._btn_close)
+
+        # ── Row 2: Toolbar (icon-only) ──
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(2)
 
         self._btn_fav = QToolButton(card)
-        self._btn_fav.setObjectName("btnAction")
+        self._btn_fav.setObjectName("btnIcon")
         self._btn_fav.setIcon(self.style().standardIcon(QStyle.SP_DialogYesButton))
-        self._btn_fav.setText("收藏")
-        self._btn_fav.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._btn_fav.setToolTip("收藏/取消收藏")
+        self._btn_fav.setFixedSize(32, 32)
         self._btn_fav.clicked.connect(self._toggle_current_favorite)
-        header.addWidget(self._btn_fav)
+        toolbar.addWidget(self._btn_fav)
 
         self._btn_up = QToolButton(card)
-        self._btn_up.setObjectName("btnCompact")
+        self._btn_up.setObjectName("btnIcon")
         self._btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
         self._btn_up.setToolTip("上移（仅收藏）")
+        self._btn_up.setFixedSize(32, 32)
         self._btn_up.clicked.connect(lambda: self._move_favorite(-1))
-        header.addWidget(self._btn_up)
+        toolbar.addWidget(self._btn_up)
 
         self._btn_down = QToolButton(card)
-        self._btn_down.setObjectName("btnCompact")
+        self._btn_down.setObjectName("btnIcon")
         self._btn_down.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
         self._btn_down.setToolTip("下移（仅收藏）")
+        self._btn_down.setFixedSize(32, 32)
         self._btn_down.clicked.connect(lambda: self._move_favorite(1))
-        header.addWidget(self._btn_down)
+        toolbar.addWidget(self._btn_down)
 
         self._btn_del_fav = QToolButton(card)
-        self._btn_del_fav.setObjectName("btnCompact")
+        self._btn_del_fav.setObjectName("btnIcon")
         self._btn_del_fav.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
         self._btn_del_fav.setToolTip("删除收藏")
+        self._btn_del_fav.setFixedSize(32, 32)
         self._btn_del_fav.clicked.connect(self._remove_current_favorite)
-        header.addWidget(self._btn_del_fav)
+        toolbar.addWidget(self._btn_del_fav)
 
         self._tabs.currentChanged.connect(lambda _: self._on_tab_changed())
 
+        self._sep1 = QFrame(card)
+        self._sep1.setObjectName("toolSep")
+        self._sep1.setFixedSize(1, 20)
+        toolbar.addWidget(self._sep1)
+
         self._btn_preview_mode = QToolButton(card)
-        self._btn_preview_mode.setObjectName("btnAction")
+        self._btn_preview_mode.setObjectName("btnIcon")
         self._btn_preview_mode.setCheckable(True)
         self._btn_preview_mode.setChecked(True)
-        self._btn_preview_mode.setText("悬浮预览")
-        self._btn_preview_mode.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._btn_preview_mode.setToolTip("切换预览显示方式")
+        self._btn_preview_mode.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        self._btn_preview_mode.setToolTip("悬浮预览 / 底部预览")
+        self._btn_preview_mode.setFixedSize(32, 32)
         self._btn_preview_mode.toggled.connect(self._set_preview_mode)
-        header.addWidget(self._btn_preview_mode)
+        toolbar.addWidget(self._btn_preview_mode)
 
-        self._btn_pin = QToolButton(card)
-        self._btn_pin.setObjectName("btnAction")
-        self._btn_pin.setCheckable(True)
-        self._btn_pin.setIcon(self.style().standardIcon(QStyle.SP_TitleBarUnshadeButton))
-        self._btn_pin.setText("置顶")
-        self._btn_pin.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self._btn_pin.setToolTip("固定（选择后不自动关闭）")
-        self._btn_pin.toggled.connect(self._set_pinned)
-        header.addWidget(self._btn_pin)
+        toolbar.addStretch(1)
 
         self._btn_clear = QToolButton(card)
-        self._btn_clear.setObjectName("btnAction")
-        self._btn_clear.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
-        self._btn_clear.setText("清空")
-        self._btn_clear.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_clear.setObjectName("btnIcon")
+        self._btn_clear.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
         self._btn_clear.setToolTip("清空历史")
+        self._btn_clear.setFixedSize(32, 32)
         self._btn_clear.clicked.connect(lambda: self._on_clear() if self._on_clear else None)
-        header.addWidget(self._btn_clear)
+        toolbar.addWidget(self._btn_clear)
 
         self._btn_settings = QToolButton(card)
-        self._btn_settings.setObjectName("btnAction")
+        self._btn_settings.setObjectName("btnIcon")
         self._btn_settings.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        self._btn_settings.setText("设置")
-        self._btn_settings.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self._btn_settings.setToolTip("设置")
+        self._btn_settings.setFixedSize(32, 32)
         self._btn_settings.clicked.connect(lambda: self._on_open_settings() if self._on_open_settings else None)
-        header.addWidget(self._btn_settings)
+        toolbar.addWidget(self._btn_settings)
 
         body = QVBoxLayout(card)
-        body.setContentsMargins(14, 14, 14, 14)
-        body.setSpacing(10)
-        body.addLayout(header)
+        body.setContentsMargins(14, 12, 14, 14)
+        body.setSpacing(8)
+        body.addLayout(title_bar)
         body.addWidget(self._search)
+        body.addLayout(toolbar)
         body.addWidget(self._tabs, 1)
         body.addWidget(self._preview)
 
@@ -578,10 +645,12 @@ class ClipPanel(QWidget):
 
     def set_items(self, items: list[ClipboardItem]) -> None:
         self._all_items = items
+        self._delegate_all.clear_caches()
         self._apply_filter()
 
     def set_favorites(self, favorites: list[tuple[str, ClipboardItem]]) -> None:
         self._favorites = favorites
+        self._delegate_fav.clear_caches()
         self._apply_filter()
 
     def toggle_visible(self) -> None:
@@ -676,6 +745,21 @@ class ClipPanel(QWidget):
     def _apply_filter(self) -> None:
         q = (self._search.text() or "").strip().lower()
         fav_ids = {fid for fid, _ in self._favorites}
+        preview_lc_cache: dict[int, str] = {}
+
+        def _preview_lc(it: ClipboardItem) -> str:
+            key = id(it)
+            cached = preview_lc_cache.get(key)
+            if cached is not None:
+                return cached
+            val = _clean_preview(it, 10_000).lower()
+            preview_lc_cache[key] = val
+            return val
+
+        def _matches_query(it: ClipboardItem) -> bool:
+            if q in _preview_lc(it):
+                return True
+            return it.item_type == "files" and any(q in p.lower() for p in (it.file_paths or ()))
 
         if not q:
             self._filtered_items = self._all_items[:]
@@ -684,30 +768,32 @@ class ClipPanel(QWidget):
             self._filtered_items = [
                 it
                 for it in self._all_items
-                if q in _clean_preview(it, 10_000).lower()
-                or (it.item_type == "files" and any(q in p.lower() for p in (it.file_paths or ())))
+                if _matches_query(it)
             ]
             self._fav_filtered = [
                 (fid, it)
                 for fid, it in self._favorites
-                if q in _clean_preview(it, 10_000).lower()
-                or (it.item_type == "files" and any(q in p.lower() for p in (it.file_paths or ())))
+                if _matches_query(it)
             ]
 
         self._list_all.clear()
         for it in self._filtered_items:
             item = QListWidgetItem()
-            item.setData(Qt.UserRole, it)
-            item.setData(Qt.UserRole + 2, it is not None and (self._fav_id_for_item(it, fav_ids) is not None))
+            item.setData(ROLE_ITEM, it)
+            item.setData(ROLE_IS_FAVORITE, self._fav_id_for_item(it, fav_ids) is not None)
+            item.setData(ROLE_TITLE, _clean_preview(it, 150))
+            item.setData(ROLE_SUBTITLE, _secondary_text(it))
             item.setToolTip(it.preview(10_000))
             self._list_all.addItem(item)
 
         self._list_fav.clear()
         for fid, it in self._fav_filtered:
             item = QListWidgetItem()
-            item.setData(Qt.UserRole, it)
-            item.setData(Qt.UserRole + 1, fid)
-            item.setData(Qt.UserRole + 2, True)
+            item.setData(ROLE_ITEM, it)
+            item.setData(ROLE_FAV_ID, fid)
+            item.setData(ROLE_IS_FAVORITE, True)
+            item.setData(ROLE_TITLE, _clean_preview(it, 150))
+            item.setData(ROLE_SUBTITLE, _secondary_text(it))
             item.setToolTip(it.preview(10_000))
             self._list_fav.addItem(item)
 
@@ -890,8 +976,7 @@ class ClipPanel(QWidget):
         if it is None:
             return
         self._on_activate(it)
-        if not self._pinned:
-            self.hide()
+        self.hide()
 
     def _current_list(self) -> QListWidget:
         return self._list_fav if self._tabs.currentIndex() == 1 else self._list_all
@@ -979,7 +1064,7 @@ class ClipPanel(QWidget):
         it = widget.itemAt(pos)
         if it is None:
             return
-        item_obj: ClipboardItem | None = it.data(Qt.UserRole)
+        item_obj: ClipboardItem | None = it.data(ROLE_ITEM)
         if item_obj is None:
             return
         menu = QMenu(widget)
@@ -1001,9 +1086,6 @@ class ClipPanel(QWidget):
         elif act_down is not None and chosen == act_down:
             self._move_favorite(1)
 
-    def _set_pinned(self, pinned: bool) -> None:
-        self._pinned = pinned
-
     def _sync_status(self) -> None:
         self._status.setText("暂停" if self._paused else "监听中")
         self._status.setProperty("paused", self._paused)
@@ -1014,12 +1096,12 @@ class ClipPanel(QWidget):
         has_actions = bool(self._on_clear) or bool(self._on_open_settings)
         self._btn_clear.setVisible(bool(self._on_clear))
         self._btn_settings.setVisible(bool(self._on_open_settings))
-        self._btn_pin.setVisible(True)
         self._btn_fav.setVisible(bool(self._toggle_favorite))
         is_fav_tab = self._tabs.currentIndex() == 1
         self._btn_up.setVisible(is_fav_tab)
         self._btn_down.setVisible(is_fav_tab)
         self._btn_del_fav.setVisible(is_fav_tab and bool(self._remove_favorite))
+        self._sep1.setVisible(is_fav_tab)
         can_reorder = is_fav_tab and not (self._search.text() or "").strip()
         self._btn_up.setEnabled(can_reorder)
         self._btn_down.setEnabled(can_reorder)
@@ -1086,28 +1168,26 @@ class ClipPanel(QWidget):
             QListWidget::item:selected {
               background: transparent;
             }
-            QToolButton#btnAction {
-              padding: 4px 10px;
-              border-radius: 9px;
-              border: 1px solid rgba(148, 163, 184, 0.4);
-              background: #FFFFFF;
-              color: #0F172A;
-            }
-            QToolButton#btnAction:hover {
-              background: #F1F5F9;
-            }
-            QToolButton#btnAction:checked {
-              background: rgba(59, 130, 246, 0.18);
-              border: 1px solid rgba(37, 99, 235, 0.5);
-            }
-            QToolButton#btnCompact {
-              padding: 4px;
+            QToolButton#btnIcon {
+              font-size: 15px;
+              padding: 0px;
               border-radius: 8px;
               border: 1px solid transparent;
+              background: transparent;
+              color: #475569;
             }
-            QToolButton#btnCompact:hover {
+            QToolButton#btnIcon:hover {
               background: rgba(148, 163, 184, 0.22);
               border: 1px solid rgba(148, 163, 184, 0.35);
+              color: #0F172A;
+            }
+            QToolButton#btnIcon:checked {
+              background: rgba(59, 130, 246, 0.18);
+              border: 1px solid rgba(37, 99, 235, 0.45);
+              color: #1D4ED8;
+            }
+            #toolSep {
+              background: rgba(148, 163, 184, 0.35);
             }
             #previewCard {
               border: 1px solid rgba(148, 163, 184, 0.45);
@@ -1138,6 +1218,52 @@ class ClipPanel(QWidget):
             QLabel#previewImage {
               background: #F8FAFC;
               border-radius: 8px;
+            }
+            QToolButton#btnWinControl {
+              font-size: 14px;
+              font-weight: 700;
+              padding: 0px;
+              border-radius: 14px;
+              border: none;
+              background: transparent;
+              color: #64748B;
+            }
+            QToolButton#btnWinControl:hover {
+              background: rgba(148, 163, 184, 0.28);
+              color: #0F172A;
+            }
+            QToolButton#btnWinClose {
+              font-size: 14px;
+              font-weight: 700;
+              padding: 0px;
+              border-radius: 14px;
+              border: none;
+              background: transparent;
+              color: #64748B;
+            }
+            QToolButton#btnWinClose:hover {
+              background: rgba(239, 68, 68, 0.18);
+              color: #DC2626;
+            }
+            QScrollBar:vertical {
+              border: none;
+              background: transparent;
+              width: 6px;
+              margin: 4px 0;
+            }
+            QScrollBar::handle:vertical {
+              background: rgba(148, 163, 184, 0.45);
+              border-radius: 3px;
+              min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+              background: rgba(100, 116, 139, 0.6);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+              height: 0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+              background: transparent;
             }
             """
         )

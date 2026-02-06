@@ -125,7 +125,7 @@ class ClipHistApp:
         self.panel.toggle_visible()
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self._apply_hotkeys, parent=None)
+        dlg = SettingsDialog(self.settings, self._apply_hotkeys, parent=self.panel)
         dlg.exec()
 
     def _handle_event(self, evt: object) -> None:
