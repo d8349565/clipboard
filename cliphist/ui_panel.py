@@ -516,7 +516,7 @@ class ClipPanel(QWidget):
         # ── Row 1: Title bar ──
         title_bar = QHBoxLayout()
         title_bar.setSpacing(8)
-        self._title = QLabel("剪切板历史", card)
+        self._title = QLabel("剪切板历史（吾爱破解）", card)
         self._title.setObjectName("title")
         title_bar.addWidget(self._title)
 

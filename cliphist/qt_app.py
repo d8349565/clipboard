@@ -38,6 +38,12 @@ class ClipHistApp:
         self.qt_app = QApplication(sys.argv)
         self.qt_app.setQuitOnLastWindowClosed(False)
 
+        self._app_icon = self._default_icon()
+        try:
+            self.qt_app.setWindowIcon(self._app_icon)
+        except Exception:
+            log.debug("设置应用图标失败", exc_info=True)
+
         self.settings = load_settings()
         self.paused = False
         self.history = ClipboardHistory(max_items=self.settings.max_items)
@@ -49,7 +55,7 @@ class ClipHistApp:
         self.hotkey_pause_hint: str | None = None
         self._hotkey_specs: dict[int, HotkeySpec] = {}
 
-        self.tray = QSystemTrayIcon(self._default_icon(), self.qt_app)
+        self.tray = QSystemTrayIcon(self._app_icon, self.qt_app)
         self.tray.setToolTip("ClipHist")
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.setContextMenu(self._build_tray_menu())
@@ -64,6 +70,10 @@ class ClipHistApp:
             remove_favorite=self._remove_favorite,
             reorder_favorites=self._reorder_favorites,
         )
+        try:
+            self.panel.setWindowIcon(self._app_icon)
+        except Exception:
+            log.debug("设置面板窗口图标失败", exc_info=True)
 
         self._bridge = _Bridge()
         self._bridge.event.connect(self._handle_event)
