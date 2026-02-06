@@ -17,6 +17,7 @@ tests
 .idea/
 .vscode/
 .trae/
+.tools
 
 *.log
 *.tmp

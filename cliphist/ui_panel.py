@@ -80,13 +80,7 @@ class _ClipListWidget(QListWidget):
 def _qimage_from_dib(dib: bytes) -> QImage | None:
     if not dib:
         return None
-    import io
     import struct
-
-    try:
-        from PIL import Image
-    except Exception:
-        return None
 
     try:
         header_size = struct.unpack_from("<I", dib, 0)[0]
@@ -102,10 +96,10 @@ def _qimage_from_dib(dib: bytes) -> QImage | None:
         file_size = 14 + len(dib)
         bf = b"BM" + struct.pack("<IHHI", file_size, 0, 0, offset)
         bmp_bytes = bf + dib
-        im = Image.open(io.BytesIO(bmp_bytes))
-        out = io.BytesIO()
-        im.save(out, format="PNG")
-        return QImage.fromData(out.getvalue(), "PNG")
+        img = QImage.fromData(bmp_bytes, "BMP")
+        if img is None or img.isNull():
+            return None
+        return img
     except Exception:
         return None
 

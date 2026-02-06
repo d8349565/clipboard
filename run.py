@@ -53,7 +53,7 @@ def _load_app():
         from cliphist.qt_app import ClipHistApp
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", "") or ""
-        if missing in ("win32con", "win32clipboard", "pythoncom", "PySide6", "PIL"):
+        if missing in ("win32con", "win32clipboard", "pythoncom", "PySide6"):
             sys.stderr.write(
                 f"依赖缺失：{missing}\n"
                 "请使用当前解释器安装依赖：\n"
