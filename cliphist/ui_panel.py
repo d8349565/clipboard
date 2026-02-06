@@ -6,9 +6,10 @@ import html as _html
 import re
 from typing import Callable
 
-from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect
+from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect, QPoint, QEvent
 from PySide6.QtGui import QColor, QCursor, QDrag, QGuiApplication, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QSizeGrip,
     QStyle,
     QStyledItemDelegate,
     QTabWidget,
@@ -358,6 +360,8 @@ class ClipPanel(QWidget):
         self._fav_filtered: list[tuple[str, ClipboardItem]] = []
         self._paused = False
         self._pinned = False
+        self._drag_pos: QPoint | None = None
+        self._hover_preview = True
 
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -384,8 +388,10 @@ class ClipPanel(QWidget):
         self._list_all.itemActivated.connect(lambda _: self._activate_current())
         self._list_all.setMouseTracking(True)
         self._list_all.currentItemChanged.connect(lambda *_: self._update_preview())
+        self._list_all.itemEntered.connect(lambda item: self._on_item_hover(self._list_all, item))
         self._list_all.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_all.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self._list_all, pos))
+        self._list_all.viewport().installEventFilter(self)
 
         self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card)
         self._list_fav.setUniformItemSizes(True)
@@ -393,8 +399,10 @@ class ClipPanel(QWidget):
         self._list_fav.itemActivated.connect(lambda _: self._activate_current())
         self._list_fav.setMouseTracking(True)
         self._list_fav.currentItemChanged.connect(lambda *_: self._update_preview())
+        self._list_fav.itemEntered.connect(lambda item: self._on_item_hover(self._list_fav, item))
         self._list_fav.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_fav.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self._list_fav, pos))
+        self._list_fav.viewport().installEventFilter(self)
 
         tab_all = QWidget(card)
         tab_all_layout = QVBoxLayout(tab_all)
@@ -452,6 +460,42 @@ class ClipPanel(QWidget):
         self._preview.setLayout(preview_body)
         self._preview_image: QImage | None = None
 
+        self._preview_popup = QFrame(self, Qt.ToolTip | Qt.FramelessWindowHint)
+        self._preview_popup.setObjectName("previewPopup")
+        self._preview_popup.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self._preview_popup.setAttribute(Qt.WA_TranslucentBackground, False)
+        self._preview_popup.hide()
+        self._popup_title = QLabel("预览", self._preview_popup)
+        self._popup_title.setObjectName("previewTitle")
+        self._popup_meta = QLabel("", self._preview_popup)
+        self._popup_meta.setObjectName("previewMeta")
+        popup_header = QHBoxLayout()
+        popup_header.addWidget(self._popup_title)
+        popup_header.addStretch(1)
+        popup_header.addWidget(self._popup_meta)
+        self._popup_stack = QStackedWidget(self._preview_popup)
+        self._popup_empty = QLabel("暂无预览", self._preview_popup)
+        self._popup_empty.setAlignment(Qt.AlignCenter)
+        self._popup_empty.setObjectName("previewEmpty")
+        self._popup_text = QTextBrowser(self._preview_popup)
+        self._popup_text.setOpenExternalLinks(False)
+        self._popup_text.setReadOnly(True)
+        self._popup_text.setFrameStyle(QFrame.NoFrame)
+        self._popup_text.setObjectName("previewText")
+        self._popup_image = QLabel(self._preview_popup)
+        self._popup_image.setAlignment(Qt.AlignCenter)
+        self._popup_image.setObjectName("previewImage")
+        self._popup_stack.addWidget(self._popup_empty)
+        self._popup_stack.addWidget(self._popup_text)
+        self._popup_stack.addWidget(self._popup_image)
+        self._popup_stack.setCurrentWidget(self._popup_empty)
+        popup_body = QVBoxLayout(self._preview_popup)
+        popup_body.setContentsMargins(10, 10, 10, 10)
+        popup_body.setSpacing(8)
+        popup_body.addLayout(popup_header)
+        popup_body.addWidget(self._popup_stack)
+        self._popup_image_data: QImage | None = None
+
         header = QHBoxLayout()
         self._title = QLabel("剪切板历史", card)
         self._title.setObjectName("title")
@@ -495,6 +539,16 @@ class ClipPanel(QWidget):
 
         self._tabs.currentChanged.connect(lambda _: self._on_tab_changed())
 
+        self._btn_preview_mode = QToolButton(card)
+        self._btn_preview_mode.setObjectName("btnAction")
+        self._btn_preview_mode.setCheckable(True)
+        self._btn_preview_mode.setChecked(True)
+        self._btn_preview_mode.setText("悬浮预览")
+        self._btn_preview_mode.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._btn_preview_mode.setToolTip("切换预览显示方式")
+        self._btn_preview_mode.toggled.connect(self._set_preview_mode)
+        header.addWidget(self._btn_preview_mode)
+
         self._btn_pin = QToolButton(card)
         self._btn_pin.setObjectName("btnAction")
         self._btn_pin.setCheckable(True)
@@ -535,9 +589,12 @@ class ClipPanel(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.addWidget(card)
 
-        self.resize(560, 560)
+        self.setMinimumSize(460, 420)
+        self.resize(640, 620)
+        self._grip = QSizeGrip(card)
         self._apply_styles()
         self._sync_status()
+        self._set_preview_mode(True)
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
@@ -598,6 +655,47 @@ class ClipPanel(QWidget):
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
         self._render_preview_image()
+        try:
+            grip_size = self._grip.sizeHint()
+            self._grip.move(
+                self.width() - grip_size.width() - 8,
+                self.height() - grip_size.height() - 8,
+            )
+        except Exception:
+            pass
+        self._render_popup_image()
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            if event.position().y() <= 48:
+                self._drag_pos = QPoint(int(event.globalPosition().x()), int(event.globalPosition().y()))
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            current = QPoint(int(event.globalPosition().x()), int(event.globalPosition().y()))
+            delta = current - self._drag_pos
+            self.move(self.pos() + delta)
+            self._drag_pos = current
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if self._hover_preview:
+            if event.type() == QEvent.Type.Leave:
+                self._hide_preview_popup()
+            elif event.type() == QEvent.Type.MouseMove:
+                if not (QApplication.keyboardModifiers() & Qt.ControlModifier):
+                    self._hide_preview_popup()
+        return super().eventFilter(obj, event)
 
     def _apply_filter(self) -> None:
         q = (self._search.text() or "").strip().lower()
@@ -646,6 +744,8 @@ class ClipPanel(QWidget):
 
     def _update_preview(self) -> None:
         it = self._item_at_current_row()
+        if self._hover_preview:
+            return
         if it is None:
             self._preview_meta.setText("")
             self._preview_stack.setCurrentWidget(self._preview_empty)
@@ -656,51 +756,14 @@ class ClipPanel(QWidget):
         ts = it.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         self._preview_meta.setText(f"{it.item_type.upper()} · {ts}")
 
-        if it.item_type == "image":
-            img = _qimage_from_dib(it.raw_bytes or b"")
-            if img is None or img.isNull():
-                self._preview_text.setPlainText("图片预览不可用")
-                self._preview_stack.setCurrentWidget(self._preview_text)
-                self._preview_image = None
-            else:
-                self._preview_image = img
-                self._render_preview_image()
-                self._preview_stack.setCurrentWidget(self._preview_image_label)
-            return
-
-        self._preview_image = None
-        self._preview_image_label.clear()
-
-        if it.item_type == "html":
-            html = _html_fragment_from_clipboard(it.raw_bytes or b"")
-            text = _html_to_plain(html or (it.text or ""), max_len=12000)
-            self._preview_text.setPlainText(text or "(HTML 内容为空)")
-            self._preview_stack.setCurrentWidget(self._preview_text)
-            return
-
-        if it.item_type == "rtf":
-            text = _rtf_to_plain(it.raw_bytes or b"", max_len=12000) or (it.text or "")
-            self._preview_text.setPlainText(text)
-            self._preview_stack.setCurrentWidget(self._preview_text)
-            return
-
-        if it.item_type == "files":
-            paths = it.file_paths or ()
-            if paths:
-                safe = "<br>".join(_html.escape(p) for p in paths[:80])
-                if len(paths) > 80:
-                    safe += "<br>…"
-                self._preview_text.setHtml(safe)
-            else:
-                self._preview_text.setPlainText("（空文件列表）")
-            self._preview_stack.setCurrentWidget(self._preview_text)
-            return
-
-        text = it.text or ""
-        if len(text) > 12000:
-            text = text[:12000] + "\n…"
-        self._preview_text.setPlainText(text)
-        self._preview_stack.setCurrentWidget(self._preview_text)
+        self._render_preview_content(
+            it,
+            self._preview_meta,
+            self._preview_text,
+            self._preview_image_label,
+            self._preview_stack,
+            docked=True,
+        )
 
     def _render_preview_image(self) -> None:
         if self._preview_image is None:
@@ -711,6 +774,126 @@ class ClipPanel(QWidget):
         pix = QPixmap.fromImage(self._preview_image)
         scaled = pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._preview_image_label.setPixmap(scaled)
+
+    def _render_popup_image(self) -> None:
+        if self._popup_image_data is None:
+            return
+        size = self._popup_stack.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        pix = QPixmap.fromImage(self._popup_image_data)
+        scaled = pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._popup_image.setPixmap(scaled)
+
+    def _render_preview_content(
+        self,
+        it: ClipboardItem,
+        meta_label: QLabel,
+        text_widget: QTextBrowser,
+        image_label: QLabel,
+        stack: QStackedWidget,
+        docked: bool,
+    ) -> None:
+        ts = it.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        meta_label.setText(f"{it.item_type.upper()} · {ts}")
+
+        if it.item_type == "image":
+            img = _qimage_from_dib(it.raw_bytes or b"")
+            if img is None or img.isNull():
+                text_widget.setPlainText("图片预览不可用")
+                stack.setCurrentWidget(text_widget)
+                if docked:
+                    self._preview_image = None
+                else:
+                    self._popup_image_data = None
+            else:
+                if docked:
+                    self._preview_image = img
+                    self._render_preview_image()
+                else:
+                    self._popup_image_data = img
+                    self._render_popup_image()
+                stack.setCurrentWidget(image_label)
+            return
+
+        if docked:
+            self._preview_image = None
+            self._preview_image_label.clear()
+        else:
+            self._popup_image_data = None
+            self._popup_image.clear()
+
+        if it.item_type == "html":
+            html = _html_fragment_from_clipboard(it.raw_bytes or b"")
+            text = _html_to_plain(html or (it.text or ""), max_len=12000)
+            text_widget.setPlainText(text or "(HTML 内容为空)")
+            stack.setCurrentWidget(text_widget)
+            return
+
+        if it.item_type == "rtf":
+            text = _rtf_to_plain(it.raw_bytes or b"", max_len=12000) or (it.text or "")
+            text_widget.setPlainText(text)
+            stack.setCurrentWidget(text_widget)
+            return
+
+        if it.item_type == "files":
+            paths = it.file_paths or ()
+            if paths:
+                text_widget.setPlainText("\n".join(paths[:80]) + ("…\n" if len(paths) > 80 else ""))
+            else:
+                text_widget.setPlainText("（空文件列表）")
+            stack.setCurrentWidget(text_widget)
+            return
+
+        text = it.text or ""
+        if len(text) > 12000:
+            text = text[:12000] + "\n…"
+        text_widget.setPlainText(text)
+        stack.setCurrentWidget(text_widget)
+
+    def _on_item_hover(self, widget: QListWidget, item: QListWidgetItem) -> None:
+        if not self._hover_preview:
+            return
+        if not (QApplication.keyboardModifiers() & Qt.ControlModifier):
+            self._hide_preview_popup()
+            return
+        it: ClipboardItem | None = item.data(Qt.UserRole)
+        if it is None:
+            return
+        pos = QCursor.pos()
+        self._show_preview_popup(it, pos)
+
+    def _show_preview_popup(self, it: ClipboardItem, pos: QPoint) -> None:
+        self._render_preview_content(
+            it,
+            self._popup_meta,
+            self._popup_text,
+            self._popup_image,
+            self._popup_stack,
+            docked=False,
+        )
+        popup_w = min(520, max(360, self.width() - 40))
+        popup_h = 220 if it.item_type != "image" else 280
+        self._preview_popup.resize(popup_w, popup_h)
+        screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        screen_geo = screen.availableGeometry()
+        x = min(max(pos.x() + 16, screen_geo.left()), screen_geo.right() - popup_w)
+        y = min(max(pos.y() + 16, screen_geo.top()), screen_geo.bottom() - popup_h)
+        self._preview_popup.move(x, y)
+        self._preview_popup.show()
+
+    def _hide_preview_popup(self) -> None:
+        if self._preview_popup.isVisible():
+            self._preview_popup.hide()
+
+    def _set_preview_mode(self, hover: bool) -> None:
+        self._hover_preview = bool(hover)
+        self._preview.setVisible(not self._hover_preview)
+        if self._hover_preview:
+            self._update_preview()
+        else:
+            self._hide_preview_popup()
+            self._update_preview()
 
     def _get_filtered_item(self, row: int) -> ClipboardItem | None:
         if row < 0 or row >= len(self._filtered_items):
@@ -952,6 +1135,11 @@ class ClipPanel(QWidget):
             }
             #previewCard {
               border: 1px solid rgba(148, 163, 184, 0.45);
+              border-radius: 12px;
+              background: #FFFFFF;
+            }
+            #previewPopup {
+              border: 1px solid rgba(148, 163, 184, 0.6);
               border-radius: 12px;
               background: #FFFFFF;
             }
