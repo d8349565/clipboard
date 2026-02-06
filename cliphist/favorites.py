@@ -3,9 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 from .models import ClipboardItem
 from .settings import default_app_dir

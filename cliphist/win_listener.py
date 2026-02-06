@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Callable
+
+log = logging.getLogger(__name__)
 
 import pythoncom
 import win32con
@@ -132,11 +135,11 @@ class ClipboardListener:
             try:
                 user32.RemoveClipboardFormatListener(hwnd)
             except Exception:
-                pass
+                log.debug("RemoveClipboardFormatListener 异常", exc_info=True)
             try:
                 win32gui.DestroyWindow(hwnd)
             except Exception:
-                pass
+                log.debug("DestroyWindow 异常", exc_info=True)
             self._hwnd = None
 
     def _wnd_proc(self, hwnd: int, msg: int, wparam: int, lparam: int):
@@ -155,7 +158,7 @@ class ClipboardListener:
             try:
                 user32.UnregisterHotKey(hwnd, int(wparam))
             except Exception:
-                pass
+                log.debug("UnregisterHotKey 异常", exc_info=True)
             self._hotkey_ids.discard(int(wparam))
             return 0
 
@@ -167,14 +170,14 @@ class ClipboardListener:
             try:
                 self._on_event(HotkeyEvent(hotkey_id=int(wparam)))
             except Exception:
-                pass
+                log.debug("热键事件回调异常", exc_info=True)
             return 0
 
         if msg == win32con.WM_CLOSE:
             try:
                 win32gui.DestroyWindow(hwnd)
             except Exception:
-                pass
+                log.debug("WM_CLOSE DestroyWindow 异常", exc_info=True)
             return 0
 
         if msg == win32con.WM_DESTROY:
@@ -184,22 +187,22 @@ class ClipboardListener:
                     try:
                         self._capture_timer.cancel()
                     except Exception:
-                        pass
+                        log.debug("取消定时器异常", exc_info=True)
                     self._capture_timer = None
             for hotkey_id in list(self._hotkey_ids):
                 try:
                     user32.UnregisterHotKey(hwnd, hotkey_id)
                 except Exception:
-                    pass
+                    log.debug("WM_DESTROY UnregisterHotKey 异常", exc_info=True)
             self._hotkey_ids.clear()
             try:
                 user32.RemoveClipboardFormatListener(hwnd)
             except Exception:
-                pass
+                log.debug("WM_DESTROY RemoveClipboardFormatListener 异常", exc_info=True)
             try:
                 win32gui.PostQuitMessage(0)
             except Exception:
-                pass
+                log.debug("PostQuitMessage 异常", exc_info=True)
             return 0
 
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
@@ -227,4 +230,4 @@ class ClipboardListener:
             if item is not None:
                 self._on_event(item)
         except Exception:
-            pass
+            log.debug("剪贴板捕获异常", exc_info=True)

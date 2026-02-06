@@ -1,6 +1,15 @@
 import os
 import sys
 import ctypes
+import logging
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+    ],
+)
 
 
 _SINGLE_INSTANCE_MUTEX = "Local\\ClipHist.SingleInstance"

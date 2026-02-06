@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import html as _html
-import re
 from typing import Callable
 
 from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect, QPoint, QEvent
@@ -30,6 +28,13 @@ from PySide6.QtWidgets import (
 )
 
 from .models import ClipboardItem
+from .text_util import (
+    _RE_RTF_CTRL,
+    _RE_WS,
+    extract_html_fragment,
+    html_to_plain_text,
+    rtf_to_plain_text,
+)
 
 
 class _ClipListWidget(QListWidget):
@@ -100,24 +105,12 @@ def _qimage_from_dib(dib: bytes) -> QImage | None:
 
 
 def _html_fragment_from_clipboard(raw: bytes, max_len: int = 12000) -> str | None:
+    """Extract the HTML fragment from raw CF_HTML bytes, truncated to *max_len*."""
     if not raw:
         return None
-    try:
-        header = raw[:4096].decode("ascii", errors="ignore")
-        start_key = "StartFragment:"
-        end_key = "EndFragment:"
-        start_i = header.find(start_key)
-        end_i = header.find(end_key)
-        if start_i != -1 and end_i != -1:
-            start_line = header[start_i : header.find("\n", start_i)].strip()
-            end_line = header[end_i : header.find("\n", end_i)].strip()
-            start = int(start_line.split(":", 1)[1].strip())
-            end = int(end_line.split(":", 1)[1].strip())
-            frag = raw[start:end]
-            s = frag.decode("utf-8", errors="ignore").strip()
-            return s[:max_len]
-    except Exception:
-        pass
+    frag = extract_html_fragment(raw)
+    if frag:
+        return frag.strip()[:max_len]
     try:
         s = raw.decode("utf-8", errors="ignore").strip()
         return s[:max_len]
@@ -125,37 +118,12 @@ def _html_fragment_from_clipboard(raw: bytes, max_len: int = 12000) -> str | Non
         return None
 
 
-_RE_HTML_TAG = re.compile(r"<[^>]+>")
-_RE_RTF_CTRL = re.compile(r"\\[a-zA-Z]+\d* ?|[{}]")
-_RE_WS = re.compile(r"\s+")
-_RE_HTML_SCRIPT_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-
-
 def _rtf_to_plain(raw: bytes, max_len: int = 12000) -> str:
-    if not raw:
-        return ""
-    try:
-        s = raw.decode("latin-1", errors="ignore").replace("\r\n", "\n").replace("\r", "\n")
-    except Exception:
-        return ""
-    s = _RE_RTF_CTRL.sub(" ", s)
-    s = _RE_WS.sub(" ", s).strip()
-    return s[:max_len]
+    return rtf_to_plain_text(raw, max_len=max_len)
 
 
 def _html_to_plain(s: str, max_len: int = 12000) -> str:
-    if not s:
-        return ""
-    s = _RE_HTML_SCRIPT_STYLE.sub(" ", s)
-    s = _RE_HTML_TAG.sub(" ", s)
-    lt = s.rfind("<")
-    gt = s.rfind(">")
-    if lt > gt:
-        s = s[:lt]
-    s = _html.unescape(s)
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = _RE_WS.sub(" ", s).strip()
-    return s[:max_len]
+    return html_to_plain_text(s, max_len=max_len)
 
 
 def _clean_preview(item: ClipboardItem, max_len: int = 120) -> str:
@@ -194,9 +162,18 @@ class _RowModel:
 
 
 class _ClipItemDelegate(QStyledItemDelegate):
+    _TYPE_COLORS: dict[str, QColor] = {
+        "text": QColor("#E0F2FE"),
+        "files": QColor("#ECFDF3"),
+        "image": QColor("#FEF3C7"),
+        "html": QColor("#FCE7F3"),
+        "rtf": QColor("#EDE9FE"),
+    }
+    _DEFAULT_TYPE_COLOR = QColor("#E2E8F0")
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._thumb_cache: dict[int, QPixmap] = {}
+        self._thumb_cache: dict[tuple, QPixmap] = {}
 
     def paint(self, painter: QPainter, option, index):  # type: ignore[override]
         it: ClipboardItem | None = index.data(Qt.UserRole)
@@ -281,7 +258,7 @@ class _ClipItemDelegate(QStyledItemDelegate):
         return base.expandedTo(base.__class__(base.width(), 58))
 
     def _image_thumb(self, it: ClipboardItem, size: int) -> QPixmap | None:
-        key = id(it)
+        key = it.dedupe_key()
         cached = self._thumb_cache.get(key)
         if cached is not None:
             return cached
@@ -311,13 +288,7 @@ class _ClipItemDelegate(QStyledItemDelegate):
         icon.paint(painter, icon_rect, Qt.AlignCenter)
 
     def _type_color(self, item_type: str) -> QColor:
-        return {
-            "text": QColor("#E0F2FE"),
-            "files": QColor("#ECFDF3"),
-            "image": QColor("#FEF3C7"),
-            "html": QColor("#FCE7F3"),
-            "rtf": QColor("#EDE9FE"),
-        }.get(item_type, QColor("#E2E8F0"))
+        return self._TYPE_COLORS.get(item_type, self._DEFAULT_TYPE_COLOR)
 
     def _icon_for(self, it: ClipboardItem, widget: QWidget | None):
         w = widget or QWidget()
@@ -377,7 +348,12 @@ class ClipPanel(QWidget):
         self._search = QLineEdit(card)
         self._search.setPlaceholderText("搜索…")
         self._search.setClearButtonEnabled(True)
-        self._search.textChanged.connect(self._apply_filter)
+
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(150)  # 150ms debounce
+        self._filter_timer.timeout.connect(self._apply_filter)
+        self._search.textChanged.connect(lambda: self._filter_timer.start())
 
         self._tabs = QTabWidget(card)
         self._tabs.setObjectName("tabs")

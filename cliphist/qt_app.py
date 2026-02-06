@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
+from dataclasses import replace
 
 import win32con
+
+log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
@@ -141,10 +145,9 @@ class ClipHistApp:
                 self.panel.set_favorites(self._get_favorites())
             if added and self._store is not None:
                 try:
-                    self._store.insert(evt)
-                    self._store.trim_to_limit(self.history.max_items)
+                    self._store.insert_and_trim(evt, self.history.max_items)
                 except Exception:
-                    pass
+                    log.exception("持久化写入失败")
 
     def _activate_item(self, item: ClipboardItem) -> None:
         set_clipboard_item(item, hwnd=self.listener.hwnd)
@@ -161,7 +164,7 @@ class ClipHistApp:
             try:
                 self._store.clear()
             except Exception:
-                pass
+                log.exception("清空持久化历史失败")
         if self.panel.isVisible():
             self.panel.set_items(self.history.items())
             self.panel.set_favorites(self._get_favorites())
@@ -174,7 +177,7 @@ class ClipHistApp:
         try:
             self.favorites.save()
         except Exception:
-            pass
+            log.exception("保存收藏失败")
         if self.panel.isVisible():
             self.panel.set_favorites(self._get_favorites())
         return True, None
@@ -184,7 +187,7 @@ class ClipHistApp:
         try:
             self.favorites.save()
         except Exception:
-            pass
+            log.exception("保存收藏失败")
         if self.panel.isVisible():
             self.panel.set_favorites(self._get_favorites())
         return True, None
@@ -194,7 +197,7 @@ class ClipHistApp:
         try:
             self.favorites.save()
         except Exception:
-            pass
+            log.exception("保存收藏排序失败")
         if self.panel.isVisible():
             self.panel.set_favorites(self._get_favorites())
         return True, None
@@ -209,26 +212,21 @@ class ClipHistApp:
                 for it in reversed(loaded):
                     self.history.add(it)
             except Exception:
+                log.exception("启用持久化失败")
                 self._store = None
                 enabled = False
         elif not enabled and self._store is not None:
             try:
                 self._store.close()
             except Exception:
-                pass
+                log.debug("关闭持久化存储异常", exc_info=True)
             self._store = None
 
-        self.settings = AppSettings(
-            max_items=self.settings.max_items,
-            persist_enabled=enabled,
-            db_path=self.settings.db_path,
-            hotkey_show_panel=self.settings.hotkey_show_panel,
-            hotkey_toggle_pause=self.settings.hotkey_toggle_pause,
-        )
+        self.settings = replace(self.settings, persist_enabled=enabled)
         try:
             save_settings(self.settings)
         except Exception:
-            pass
+            log.exception("保存设置失败")
 
         if self.panel.isVisible():
             self.panel.set_items(self.history.items())
@@ -238,11 +236,11 @@ class ClipHistApp:
         try:
             self._act_pause.setChecked(self.paused)
         except Exception:
-            pass
+            log.debug("更新托盘菜单异常", exc_info=True)
         try:
             self._act_persist.setChecked(self._store is not None)
         except Exception:
-            pass
+            log.debug("更新托盘菜单异常", exc_info=True)
 
         self.panel.set_paused(self.paused)
 
@@ -254,7 +252,7 @@ class ClipHistApp:
         try:
             self.tray.setToolTip(tip)
         except Exception:
-            pass
+            log.debug("更新托盘提示异常", exc_info=True)
 
     def _register_hotkeys_with_fallback(self) -> None:
         ok, _ = self._apply_hotkeys(self.settings.hotkey_show_panel, self.settings.hotkey_toggle_pause, save=False)
@@ -290,7 +288,7 @@ class ClipHistApp:
                 5000,
             )
         except Exception:
-            pass
+            log.debug("显示热键警告异常", exc_info=True)
 
     def _apply_hotkeys(self, show_seq: str, pause_seq: str, save: bool = True) -> tuple[bool, str | None]:
         show_seq = (show_seq or "").strip()
@@ -350,17 +348,15 @@ class ClipHistApp:
         return True, warn
 
     def _save_hotkey_settings(self, show_seq: str, pause_seq: str) -> None:
-        self.settings = AppSettings(
-            max_items=self.settings.max_items,
-            persist_enabled=self.settings.persist_enabled,
-            db_path=self.settings.db_path,
+        self.settings = replace(
+            self.settings,
             hotkey_show_panel=show_seq,
             hotkey_toggle_pause=pause_seq,
         )
         try:
             save_settings(self.settings)
         except Exception:
-            pass
+            log.exception("保存热键设置失败")
 
     def _restore_hotkeys(self, show_spec: HotkeySpec | None, pause_spec: HotkeySpec | None) -> None:
         self.listener.unregister_hotkey(HOTKEY_TOGGLE_PANEL)
@@ -402,17 +398,17 @@ class ClipHistApp:
         try:
             self.listener.stop()
         except Exception:
-            pass
+            log.debug("停止监听器异常", exc_info=True)
         try:
             if self._store is not None:
                 self._store.close()
         except Exception:
-            pass
+            log.debug("关闭持久化存储异常", exc_info=True)
         try:
             self.tray.hide()
         except Exception:
-            pass
+            log.debug("隐藏托盘异常", exc_info=True)
         try:
             self.qt_app.quit()
         except Exception:
-            pass
+            log.debug("退出应用异常", exc_info=True)

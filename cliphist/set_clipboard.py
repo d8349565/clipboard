@@ -1,43 +1,24 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-import time
+import logging
+
+log = logging.getLogger(__name__)
 
 import win32clipboard
 import win32con
 
-from .capture import _extract_html_fragment_preview, _rtf_preview
+from .clipboard_util import open_clipboard
 from .models import ClipboardItem
+from .text_util import html_fragment_preview as _extract_html_fragment_preview
+from .text_util import rtf_to_plain_text as _rtf_preview
 
 
 HTML_FORMAT_NAME = "HTML Format"
 RTF_FORMAT_NAME = "Rich Text Format"
 
 
-@contextmanager
-def _open_clipboard(hwnd: int | None, retries: int = 10, delay_s: float = 0.02):
-    last_exc: Exception | None = None
-    for _ in range(max(1, retries)):
-        try:
-            win32clipboard.OpenClipboard(hwnd)
-            last_exc = None
-            break
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(delay_s)
-    if last_exc is not None:
-        raise last_exc
-    try:
-        yield
-    finally:
-        try:
-            win32clipboard.CloseClipboard()
-        except Exception:
-            pass
-
-
 def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
-    with _open_clipboard(hwnd):
+    with open_clipboard(hwnd):
         win32clipboard.EmptyClipboard()
 
         if item.item_type == "text":

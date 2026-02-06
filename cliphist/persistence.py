@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
 
 from .models import ClipboardItem, ClipboardItemType
 
@@ -37,6 +40,17 @@ class SQLiteHistoryStore:
             pass
 
     def insert(self, item: ClipboardItem) -> None:
+        self._do_insert(item)
+        self._conn.commit()
+
+    def insert_and_trim(self, item: ClipboardItem, limit: int) -> None:
+        """Insert an item and trim old rows in a single transaction (one commit)."""
+        self._do_insert(item)
+        if limit > 0:
+            self._do_trim(limit)
+        self._conn.commit()
+
+    def _do_insert(self, item: ClipboardItem) -> None:
         created_at_ms = int(item.created_at.timestamp() * 1000)
         file_paths_json = None
         if item.file_paths is not None:
@@ -45,11 +59,14 @@ class SQLiteHistoryStore:
             "INSERT INTO clipboard_items(created_at_ms, item_type, text, file_paths_json, raw_bytes) VALUES (?,?,?,?,?)",
             (created_at_ms, item.item_type, item.text, file_paths_json, item.raw_bytes),
         )
-        self._conn.commit()
 
     def trim_to_limit(self, limit: int) -> None:
         if limit <= 0:
             return
+        self._do_trim(limit)
+        self._conn.commit()
+
+    def _do_trim(self, limit: int) -> None:
         self._conn.execute(
             """
             DELETE FROM clipboard_items
@@ -61,7 +78,6 @@ class SQLiteHistoryStore:
             """,
             (limit,),
         )
-        self._conn.commit()
 
     def clear(self) -> None:
         self._conn.execute("DELETE FROM clipboard_items")

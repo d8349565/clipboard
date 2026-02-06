@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from threading import RLock
-from typing import Deque, Iterable
+from typing import Deque, Iterator
 
 from .models import ClipboardItem
 
@@ -34,5 +34,5 @@ class ClipboardHistory:
         with self._lock:
             return list(self._items)
 
-    def __iter__(self) -> Iterable[ClipboardItem]:
+    def __iter__(self) -> Iterator[ClipboardItem]:
         return iter(self.items())

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
+
+log = logging.getLogger(__name__)
+
+
+MAX_ITEMS_LIMIT: int = 10000
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +44,7 @@ def load_settings() -> AppSettings:
     max_items = int(data.get("max_items", 200))
     if max_items <= 0:
         max_items = 200
+    max_items = min(max_items, MAX_ITEMS_LIMIT)
     persist_enabled = bool(data.get("persist_enabled", False))
     db_path = data.get("db_path") or None
     hotkey_show_panel = str(data.get("hotkey_show_panel") or "Ctrl+Shift+V")
