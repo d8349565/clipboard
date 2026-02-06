@@ -12,6 +12,8 @@ ClipHist 是一个剪贴板历史工具：常驻系统托盘，自动记录你�
 
 ## 2. 下载与使用
 
+下载:https://leezfy.lanzouq.com/iUVDK3hxw5ij 密码:ep3k
+
 目录内找到并运行：`ClipHist.exe`。
 
 ![](https://img.ldzfy.cn/picgo/20260206143726.png)
