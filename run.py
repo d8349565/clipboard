@@ -7,7 +7,7 @@ logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stderr),
+        logging.StreamHandler(sys.stderr or open(os.devnull, "w")),
     ],
 )
 
@@ -47,6 +47,18 @@ def _release_single_instance() -> None:
     _mutex_handle = None
 
 
+def _msgbox(text: str, title: str = "ClipHist") -> None:
+    """在 --windowed 打包模式下 sys.stderr 为 None，使用 Win32 弹窗通知用户。"""
+    try:
+        MB_OK = 0x0
+        MB_ICONINFORMATION = 0x40
+        ctypes.windll.user32.MessageBoxW(None, text, title, MB_OK | MB_ICONINFORMATION)
+    except Exception:
+        # 终极兜底：尝试 stderr（开发模式可用）
+        if sys.stderr is not None:
+            sys.stderr.write(text + "\n")
+
+
 def _load_app():
     try:
         os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.window=false")
@@ -54,10 +66,11 @@ def _load_app():
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", "") or ""
         if missing in ("win32con", "win32clipboard", "pythoncom", "PySide6"):
-            sys.stderr.write(
+            _msgbox(
                 f"依赖缺失：{missing}\n"
                 "请使用当前解释器安装依赖：\n"
-                f"  {sys.executable} -m pip install -r requirements.txt\n"
+                f"  {sys.executable} -m pip install -r requirements.txt",
+                "ClipHist - 缺少依赖",
             )
         raise
     return ClipHistApp
@@ -65,7 +78,7 @@ def _load_app():
 
 def main() -> None:
     if not _acquire_single_instance():
-        sys.stderr.write("ClipHist 已在运行，请先退出已有实例（托盘图标）后再启动。\n")
+        _msgbox("ClipHist 已在运行中。\n\n请查看系统托盘区域的 ClipHist 图标。")
         raise SystemExit(0)
 
     ClipHistApp = _load_app()

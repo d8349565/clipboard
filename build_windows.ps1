@@ -8,10 +8,34 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
-Write-Host "Installing build dependencies..."
-& $Python -m pip install -r requirements.txt
-& $Python -m pip install pyinstaller
+# ── 1. 创建干净的虚拟环境（体积更小） ──
+$venvDir = Join-Path $projectRoot ".build_venv"
+if (Test-Path $venvDir) {
+    Write-Host "Removing previous build venv..."
+    Remove-Item -Recurse -Force $venvDir
+}
 
+Write-Host "Creating isolated build virtual environment..."
+& $Python -m venv $venvDir
+$venvPython = Join-Path $venvDir "Scripts\python.exe"
+
+Write-Host "Installing build dependencies into venv..."
+& $venvPython -m pip install --upgrade pip --quiet
+& $venvPython -m pip install -r requirements.txt --quiet
+& $venvPython -m pip install pyinstaller --quiet
+
+# ── 2. 生成图标（如果不存在） ──
+$iconPath = Join-Path $projectRoot "assets\icon.ico"
+if (-not (Test-Path $iconPath)) {
+    Write-Host "Generating application icon..."
+    & $venvPython generate_icon.py
+    if (-not (Test-Path $iconPath)) {
+        Write-Warning "Icon generation failed, building without icon."
+        $iconPath = $null
+    }
+}
+
+# ── 3. 清理旧产物 ──
 Write-Host "Cleaning old build output..."
 Remove-Item -Recurse -Force "$projectRoot\build" -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force "$projectRoot\dist" -ErrorAction SilentlyContinue
@@ -23,7 +47,16 @@ $pyinstallerArgs = @(
     "--windowed",
     "--onefile",
     "--name", "ClipHist",
-    "--optimize", "2",
+    "--optimize", "2"
+)
+
+# 添加图标参数
+if ($iconPath -and (Test-Path $iconPath)) {
+    $pyinstallerArgs += @("--icon", $iconPath)
+    $pyinstallerArgs += @("--add-data", "$iconPath;assets")
+}
+
+$pyinstallerArgs += @(
     "--exclude-module", "pytest",
     "--exclude-module", "tkinter",
     "--exclude-module", "unittest",
@@ -81,7 +114,7 @@ $pyinstallerArgs = @(
 )
 
 Write-Host "Building executable (size-optimized onefile)..."
-& $Python -m PyInstaller @pyinstallerArgs
+& $venvPython -m PyInstaller @pyinstallerArgs
 
 $exePath = Join-Path $projectRoot "dist\ClipHist.exe"
 if (-not (Test-Path $exePath)) {
@@ -110,3 +143,7 @@ if ($UseUpx) {
 
 $sizeMB = [math]::Round(((Get-Item $exePath).Length / 1MB), 2)
 Write-Host "Done: $exePath ($sizeMB MB)"
+
+# ── 清理构建用虚拟环境 ──
+Write-Host "Cleaning up build venv..."
+Remove-Item -Recurse -Force $venvDir -ErrorAction SilentlyContinue

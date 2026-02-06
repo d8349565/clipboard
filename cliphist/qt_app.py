@@ -80,6 +80,17 @@ class ClipHistApp:
         self._sync_ui_state()
 
     def _default_icon(self) -> QIcon:
+        # 优先使用自定义图标
+        icon_candidates = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "icon.ico"),
+        ]
+        # PyInstaller 打包后的路径
+        if getattr(sys, "_MEIPASS", None):
+            icon_candidates.insert(0, os.path.join(sys._MEIPASS, "assets", "icon.ico"))
+        for p in icon_candidates:
+            if os.path.isfile(p):
+                return QIcon(p)
         return self.qt_app.style().standardIcon(QStyle.SP_FileDialogDetailedView)
 
     def _build_tray_menu(self) -> QMenu:
