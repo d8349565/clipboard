@@ -735,6 +735,12 @@ class ClipPanel(QWidget):
         super().mouseReleaseEvent(event)
 
     def eventFilter(self, obj, event):  # type: ignore[override]
+        if event.type() == QEvent.Type.KeyPress:
+            key = getattr(event, "key", lambda: None)()
+            if key in (Qt.Key_Tab, Qt.Key_Backtab) and self._panel_has_focus():
+                self._cycle_tabs(1 if key == Qt.Key_Tab else -1)
+                return True
+
         if self._hover_preview:
             if event.type() == QEvent.Type.Leave and self._is_preview_list_viewport(obj):
                 self._hide_preview_popup()
@@ -748,6 +754,25 @@ class ClipPanel(QWidget):
             elif event.type() == QEvent.Type.KeyRelease and getattr(event, "key", lambda: None)() == Qt.Key_Control:
                 self._hide_preview_popup()
         return super().eventFilter(obj, event)
+
+    def _panel_has_focus(self) -> bool:
+        if not self.isVisible():
+            return False
+        fw = QApplication.focusWidget()
+        if fw is None:
+            return False
+        return fw is self or self.isAncestorOf(fw)
+
+    def _cycle_tabs(self, step: int) -> None:
+        count = self._tabs.count()
+        if count <= 1:
+            return
+        idx = (self._tabs.currentIndex() + step) % count
+        self._tabs.setCurrentIndex(idx)
+        current = self._current_list()
+        if current.count() > 0 and current.currentRow() < 0:
+            current.setCurrentRow(0)
+        current.setFocus()
 
     def _is_preview_list_viewport(self, obj) -> bool:
         return obj is self._list_all.viewport() or obj is self._list_fav.viewport()
