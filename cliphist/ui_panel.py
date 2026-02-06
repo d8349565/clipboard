@@ -638,6 +638,7 @@ class ClipPanel(QWidget):
         self._apply_styles()
         self._sync_status()
         self._set_preview_mode(True)
+        QApplication.instance().installEventFilter(self)
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
@@ -735,12 +736,46 @@ class ClipPanel(QWidget):
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         if self._hover_preview:
-            if event.type() == QEvent.Type.Leave:
+            if event.type() == QEvent.Type.Leave and self._is_preview_list_viewport(obj):
                 self._hide_preview_popup()
-            elif event.type() == QEvent.Type.MouseMove:
-                if not (QApplication.keyboardModifiers() & Qt.ControlModifier):
+            elif event.type() == QEvent.Type.MouseMove and self._is_preview_list_viewport(obj):
+                if QApplication.keyboardModifiers() & Qt.ControlModifier:
+                    self._sync_hover_popup_from_cursor()
+                else:
                     self._hide_preview_popup()
+            elif event.type() == QEvent.Type.KeyPress and getattr(event, "key", lambda: None)() == Qt.Key_Control:
+                self._sync_hover_popup_from_cursor()
+            elif event.type() == QEvent.Type.KeyRelease and getattr(event, "key", lambda: None)() == Qt.Key_Control:
+                self._hide_preview_popup()
         return super().eventFilter(obj, event)
+
+    def _is_preview_list_viewport(self, obj) -> bool:
+        return obj is self._list_all.viewport() or obj is self._list_fav.viewport()
+
+    def _hover_target_under_cursor(self) -> tuple[QListWidget, QListWidgetItem] | None:
+        pos = QCursor.pos()
+        for widget in (self._list_all, self._list_fav):
+            vp = widget.viewport()
+            local = vp.mapFromGlobal(pos)
+            if vp.rect().contains(local):
+                it = widget.itemAt(local)
+                if it is not None:
+                    return widget, it
+        return None
+
+    def _sync_hover_popup_from_cursor(self) -> None:
+        if not self._hover_preview or not self.isVisible():
+            self._hide_preview_popup()
+            return
+        if not (QApplication.keyboardModifiers() & Qt.ControlModifier):
+            self._hide_preview_popup()
+            return
+        target = self._hover_target_under_cursor()
+        if target is None:
+            self._hide_preview_popup()
+            return
+        widget, item = target
+        self._on_item_hover(widget, item)
 
     def _apply_filter(self) -> None:
         q = (self._search.text() or "").strip().lower()
@@ -919,7 +954,7 @@ class ClipPanel(QWidget):
         if not (QApplication.keyboardModifiers() & Qt.ControlModifier):
             self._hide_preview_popup()
             return
-        it: ClipboardItem | None = item.data(Qt.UserRole)
+        it: ClipboardItem | None = item.data(ROLE_ITEM)
         if it is None:
             return
         pos = QCursor.pos()
