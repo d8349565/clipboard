@@ -15,6 +15,7 @@ class ClipboardItem:
     text: str | None = None
     file_paths: tuple[str, ...] | None = None
     raw_bytes: bytes | None = None
+    image_bytes: bytes | None = None
 
     @staticmethod
     def now_utc() -> datetime:
@@ -22,16 +23,16 @@ class ClipboardItem:
 
     def dedupe_key(self) -> tuple:
         if self.item_type == "text":
-            return ("text", self.text or "")
+            return ("text", self.text or "", self.image_bytes or b"")
         if self.item_type == "files":
             return ("files", self.file_paths or ())
         if self.item_type == "image":
             return ("image", self.raw_bytes or b"")
         if self.item_type in ("html", "rtf"):
             if self.raw_bytes is not None:
-                return (self.item_type, self.raw_bytes)
-            return (self.item_type, self.text or "")
-        return ("unknown", self.text or "", self.file_paths or (), self.raw_bytes or b"")
+                return (self.item_type, self.raw_bytes, self.image_bytes or b"")
+            return (self.item_type, self.text or "", self.image_bytes or b"")
+        return ("unknown", self.text or "", self.file_paths or (), self.raw_bytes or b"", self.image_bytes or b"")
 
     def preview(self, max_len: int = 120) -> str:
         if self.item_type == "text":

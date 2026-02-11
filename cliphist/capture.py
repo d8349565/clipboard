@@ -38,6 +38,36 @@ def _get_rtf_fmt() -> int:
     return _cached_rtf_fmt
 
 
+def _to_bytes(v: object) -> bytes | None:
+    if isinstance(v, bytes):
+        return v
+    if isinstance(v, bytearray):
+        return bytes(v)
+    if isinstance(v, memoryview):
+        return v.tobytes()
+    if isinstance(v, str):
+        return v.encode("utf-8", errors="replace")
+    try:
+        return bytes(v)  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def _capture_image_bytes() -> bytes | None:
+    dibv5_fmt = getattr(win32con, "CF_DIBV5", 17)
+    for fmt in (dibv5_fmt, win32con.CF_DIB):
+        if not win32clipboard.IsClipboardFormatAvailable(fmt):
+            continue
+        dib = _to_bytes(win32clipboard.GetClipboardData(fmt))
+        if not dib:
+            continue
+        if len(dib) > MAX_IMAGE_BYTES:
+            log.warning("图片超出大小限制 (%d bytes)，已跳过", len(dib))
+            continue
+        return dib
+    return None
+
+
 def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
     with open_clipboard(hwnd):
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
@@ -48,52 +78,34 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
                 file_paths=file_paths,
             )
 
-        if win32clipboard.IsClipboardFormatAvailable(getattr(win32con, "CF_DIBV5", 17)):
-            dib = win32clipboard.GetClipboardData(getattr(win32con, "CF_DIBV5", 17))
-            if isinstance(dib, (bytes, bytearray)) and dib:
-                if len(dib) > MAX_IMAGE_BYTES:
-                    log.warning("\u56fe\u7247\u8d85\u51fa\u5927\u5c0f\u9650\u5236 (%d bytes)\uff0c\u5df2\u8df3\u8fc7", len(dib))
-                else:
-                    return ClipboardItem(
-                        created_at=ClipboardItem.now_utc(),
-                        item_type="image",
-                        raw_bytes=bytes(dib),
-                    )
-
-        if win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB):
-            dib = win32clipboard.GetClipboardData(win32con.CF_DIB)
-            if isinstance(dib, (bytes, bytearray)) and dib:
-                if len(dib) > MAX_IMAGE_BYTES:
-                    log.warning("\u56fe\u7247\u8d85\u51fa\u5927\u5c0f\u9650\u5236 (%d bytes)\uff0c\u5df2\u8df3\u8fc7", len(dib))
-                else:
-                    return ClipboardItem(
-                        created_at=ClipboardItem.now_utc(),
-                        item_type="image",
-                        raw_bytes=bytes(dib),
-                    )
+        image_bytes = _capture_image_bytes()
 
         html_fmt = _get_html_fmt()
         if win32clipboard.IsClipboardFormatAvailable(html_fmt):
-            raw = win32clipboard.GetClipboardData(html_fmt)
-            raw_b = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+            raw_b = _to_bytes(win32clipboard.GetClipboardData(html_fmt))
+            if not raw_b:
+                raw_b = b""
             preview = _extract_html_fragment_preview(raw_b)
             return ClipboardItem(
                 created_at=ClipboardItem.now_utc(),
                 item_type="html",
                 text=preview,
                 raw_bytes=raw_b,
+                image_bytes=image_bytes,
             )
 
         rtf_fmt = _get_rtf_fmt()
         if win32clipboard.IsClipboardFormatAvailable(rtf_fmt):
-            raw = win32clipboard.GetClipboardData(rtf_fmt)
-            raw_b = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+            raw_b = _to_bytes(win32clipboard.GetClipboardData(rtf_fmt))
+            if not raw_b:
+                raw_b = b""
             preview = _rtf_preview(raw_b)
             return ClipboardItem(
                 created_at=ClipboardItem.now_utc(),
                 item_type="rtf",
                 text=preview,
                 raw_bytes=raw_b,
+                image_bytes=image_bytes,
             )
 
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
@@ -104,6 +116,14 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
                 created_at=ClipboardItem.now_utc(),
                 item_type="text",
                 text=str(text),
+                image_bytes=image_bytes,
+            )
+
+        if image_bytes:
+            return ClipboardItem(
+                created_at=ClipboardItem.now_utc(),
+                item_type="image",
+                raw_bytes=image_bytes,
             )
 
     return None

@@ -21,15 +21,21 @@ def item_fingerprint(item: ClipboardItem) -> str:
     h.update(b"\0")
     if item.item_type == "text":
         h.update((item.text or "").encode("utf-8", errors="replace"))
+        h.update(b"\0")
+        h.update(item.image_bytes or b"")
     elif item.item_type == "files":
         for p in (item.file_paths or ()):
             h.update(p.encode("utf-8", errors="replace"))
             h.update(b"\n")
+        h.update(b"\0")
+        h.update(item.image_bytes or b"")
     elif item.item_type in ("image", "html", "rtf"):
         if item.raw_bytes is not None:
             h.update(item.raw_bytes)
         else:
             h.update((item.text or "").encode("utf-8", errors="replace"))
+        h.update(b"\0")
+        h.update(item.image_bytes or b"")
     else:
         h.update((item.text or "").encode("utf-8", errors="replace"))
         h.update(b"\0")
@@ -48,6 +54,7 @@ def _encode_item(it: ClipboardItem) -> dict:
         "text": it.text,
         "file_paths": list(it.file_paths) if it.file_paths else None,
         "raw_b64": base64.b64encode(it.raw_bytes).decode("ascii") if it.raw_bytes is not None else None,
+        "image_b64": base64.b64encode(it.image_bytes).decode("ascii") if it.image_bytes is not None else None,
     }
 
 
@@ -58,7 +65,9 @@ def _decode_item(data: dict) -> ClipboardItem | None:
         text = data.get("text")
         file_paths = data.get("file_paths")
         raw_b64 = data.get("raw_b64")
+        image_b64 = data.get("image_b64")
         raw_bytes = base64.b64decode(raw_b64) if raw_b64 else None
+        image_bytes = base64.b64decode(image_b64) if image_b64 else None
         fp = tuple(file_paths) if isinstance(file_paths, list) else None
         return ClipboardItem(
             created_at=created_at,
@@ -66,6 +75,7 @@ def _decode_item(data: dict) -> ClipboardItem | None:
             text=str(text) if text is not None else None,
             file_paths=fp,
             raw_bytes=raw_bytes,
+            image_bytes=image_bytes,
         )
     except Exception:
         return None

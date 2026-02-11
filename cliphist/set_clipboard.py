@@ -17,11 +17,18 @@ HTML_FORMAT_NAME = "HTML Format"
 RTF_FORMAT_NAME = "Rich Text Format"
 
 
+def _set_image_if_any(item: ClipboardItem) -> None:
+    if not item.image_bytes:
+        return
+    win32clipboard.SetClipboardData(win32con.CF_DIB, item.image_bytes)
+
+
 def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
     with open_clipboard(hwnd):
         win32clipboard.EmptyClipboard()
 
         if item.item_type == "text":
+            _set_image_if_any(item)
             win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, item.text or "")
             return
 
@@ -39,6 +46,7 @@ def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
             fmt = win32clipboard.RegisterClipboardFormat(HTML_FORMAT_NAME)
             if item.raw_bytes:
                 win32clipboard.SetClipboardData(fmt, item.raw_bytes)
+            _set_image_if_any(item)
             plain_text = item.text or ""
             if item.raw_bytes:
                 plain_text = _extract_html_fragment_preview(item.raw_bytes, max_len=12000) or plain_text
@@ -49,6 +57,7 @@ def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
             fmt = win32clipboard.RegisterClipboardFormat(RTF_FORMAT_NAME)
             if item.raw_bytes:
                 win32clipboard.SetClipboardData(fmt, item.raw_bytes)
+            _set_image_if_any(item)
             plain_text = item.text or ""
             if item.raw_bytes:
                 plain_text = _rtf_preview(item.raw_bytes, max_len=12000) or plain_text

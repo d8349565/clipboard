@@ -74,7 +74,11 @@ class _ClipListWidget(QListWidget):
             img = _qimage_from_dib(it.raw_bytes or b"")
             if img is not None and not img.isNull():
                 drag.setPixmap(QPixmap.fromImage(img).scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        drag.exec(supportedActions)
+        # File drags should always behave like copy to avoid moving source files.
+        if it.item_type == "files":
+            drag.exec(Qt.CopyAction)
+        else:
+            drag.exec(supportedActions)
 
 
 def _qimage_from_dib(dib: bytes) -> QImage | None:

@@ -26,12 +26,21 @@ class SQLiteHistoryStore:
               item_type TEXT NOT NULL,
               text TEXT,
               file_paths_json TEXT,
-              raw_bytes BLOB
+              raw_bytes BLOB,
+              image_bytes BLOB
             )
             """
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON clipboard_items(created_at_ms DESC)")
+        self._ensure_column("image_bytes", "BLOB")
         self._conn.commit()
+
+    def _ensure_column(self, column_name: str, column_type: str) -> None:
+        cur = self._conn.execute("PRAGMA table_info(clipboard_items)")
+        existing = {str(row[1]).lower() for row in cur.fetchall()}
+        if column_name.lower() in existing:
+            return
+        self._conn.execute(f"ALTER TABLE clipboard_items ADD COLUMN {column_name} {column_type}")
 
     def close(self) -> None:
         try:
@@ -56,8 +65,8 @@ class SQLiteHistoryStore:
         if item.file_paths is not None:
             file_paths_json = json.dumps(list(item.file_paths), ensure_ascii=False)
         self._conn.execute(
-            "INSERT INTO clipboard_items(created_at_ms, item_type, text, file_paths_json, raw_bytes) VALUES (?,?,?,?,?)",
-            (created_at_ms, item.item_type, item.text, file_paths_json, item.raw_bytes),
+            "INSERT INTO clipboard_items(created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes) VALUES (?,?,?,?,?,?)",
+            (created_at_ms, item.item_type, item.text, file_paths_json, item.raw_bytes, item.image_bytes),
         )
 
     def trim_to_limit(self, limit: int) -> None:
@@ -87,11 +96,11 @@ class SQLiteHistoryStore:
         if limit <= 0:
             return []
         cur = self._conn.execute(
-            "SELECT created_at_ms, item_type, text, file_paths_json, raw_bytes FROM clipboard_items ORDER BY created_at_ms DESC LIMIT ?",
+            "SELECT created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes FROM clipboard_items ORDER BY created_at_ms DESC LIMIT ?",
             (limit,),
         )
         items: list[ClipboardItem] = []
-        for created_at_ms, item_type, text, file_paths_json, raw_bytes in cur.fetchall():
+        for created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes in cur.fetchall():
             created_at = datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
             file_paths = None
             if file_paths_json:
@@ -106,6 +115,7 @@ class SQLiteHistoryStore:
                     text=text,
                     file_paths=file_paths,
                     raw_bytes=raw_bytes,
+                    image_bytes=image_bytes,
                 )
             )
         return items
@@ -115,4 +125,3 @@ def _coerce_item_type(v: str) -> ClipboardItemType:
     if v in ("text", "files", "image", "html", "rtf", "unknown"):
         return v  # type: ignore[return-value]
     return "unknown"
-
