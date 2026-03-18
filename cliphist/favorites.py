@@ -118,6 +118,29 @@ class FavoritesStore:
                 return True
         return False
 
+    def replace_item(self, old_item: ClipboardItem, new_item: ClipboardItem) -> bool:
+        old_id = item_fingerprint(old_item)
+        new_id = item_fingerprint(new_item)
+        old_idx = -1
+        new_idx = -1
+        for i, e in enumerate(self._entries):
+            if e.fav_id == old_id and old_idx < 0:
+                old_idx = i
+            if e.fav_id == new_id and new_idx < 0:
+                new_idx = i
+        if old_idx < 0:
+            return False
+
+        if new_idx >= 0 and new_idx != old_idx:
+            self._entries.pop(old_idx)
+            if old_idx < new_idx:
+                new_idx -= 1
+            self._entries[new_idx] = FavoriteEntry(fav_id=new_id, item=new_item)
+            return True
+
+        self._entries[old_idx] = FavoriteEntry(fav_id=new_id, item=new_item)
+        return True
+
     def toggle(self, item: ClipboardItem) -> tuple[bool, str]:
         fid = item_fingerprint(item)
         if self.remove_by_id(fid):

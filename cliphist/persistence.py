@@ -92,6 +92,12 @@ class SQLiteHistoryStore:
         self._conn.execute("DELETE FROM clipboard_items")
         self._conn.commit()
 
+    def replace_all(self, items: list[ClipboardItem]) -> None:
+        self._conn.execute("DELETE FROM clipboard_items")
+        for item in items:
+            self._do_insert(item)
+        self._conn.commit()
+
     def load_recent(self, limit: int) -> list[ClipboardItem]:
         if limit <= 0:
             return []

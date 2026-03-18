@@ -30,6 +30,14 @@ class ClipboardHistory:
         with self._lock:
             self._items.clear()
 
+    def replace_first(self, old_item: ClipboardItem, new_item: ClipboardItem) -> bool:
+        with self._lock:
+            for idx, current in enumerate(self._items):
+                if current is old_item or current == old_item:
+                    self._items[idx] = new_item
+                    return True
+        return False
+
     def items(self) -> list[ClipboardItem]:
         with self._lock:
             return list(self._items)

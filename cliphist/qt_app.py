@@ -69,6 +69,7 @@ class ClipHistApp:
             toggle_favorite=self._toggle_favorite,
             remove_favorite=self._remove_favorite,
             reorder_favorites=self._reorder_favorites,
+            edit_item=self._edit_item,
         )
         try:
             self.panel.setWindowIcon(self._app_icon)
@@ -166,7 +167,7 @@ class ClipHistApp:
                 self.panel.set_favorites(self._get_favorites())
             if added and self._store is not None:
                 try:
-                    self._store.insert_and_trim(evt, self.history.max_items)
+                    self._store.insert(evt)
                 except Exception:
                     log.exception("持久化写入失败")
 
@@ -220,6 +221,30 @@ class ClipHistApp:
         except Exception:
             log.exception("保存收藏排序失败")
         if self.panel.isVisible():
+            self.panel.set_favorites(self._get_favorites())
+        return True, None
+
+    def _edit_item(self, old_item: ClipboardItem, new_item: ClipboardItem) -> tuple[bool, str | None]:
+        replaced = self.history.replace_first(old_item, new_item)
+        if not replaced:
+            return False, "未找到要编辑的历史记录"
+
+        changed_fav = self.favorites.replace_item(old_item, new_item)
+        if changed_fav:
+            try:
+                self.favorites.save()
+            except Exception:
+                log.exception("保存编辑后的收藏失败")
+
+        if self._store is not None:
+            try:
+                self._store.replace_all(self.history.items())
+            except Exception:
+                log.exception("同步编辑后的持久化历史失败")
+                return False, "已更新内存历史，但持久化同步失败"
+
+        if self.panel.isVisible():
+            self.panel.set_items(self.history.items())
             self.panel.set_favorites(self._get_favorites())
         return True, None
 

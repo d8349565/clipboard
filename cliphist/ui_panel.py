@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
 
@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect, QPoint, QEvent
 from PySide6.QtGui import QColor, QCursor, QDrag, QGuiApplication, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
@@ -15,7 +16,10 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QMenu,
+    QPlainTextEdit,
+    QPushButton,
     QSizeGrip,
     QStyle,
     QStyledItemDelegate,
@@ -354,6 +358,7 @@ class ClipPanel(QWidget):
         toggle_favorite: Callable[[ClipboardItem], tuple[bool, str | None]] | None = None,
         remove_favorite: Callable[[str], tuple[bool, str | None]] | None = None,
         reorder_favorites: Callable[[list[str]], tuple[bool, str | None]] | None = None,
+        edit_item: Callable[[ClipboardItem, ClipboardItem], tuple[bool, str | None]] | None = None,
     ) -> None:
         super().__init__()
         self._on_activate = on_activate
@@ -363,6 +368,7 @@ class ClipPanel(QWidget):
         self._toggle_favorite = toggle_favorite
         self._remove_favorite = remove_favorite
         self._reorder_favorites = reorder_favorites
+        self._edit_item = edit_item
         self._all_items: list[ClipboardItem] = []
         self._filtered_items: list[ClipboardItem] = []
         self._favorites: list[tuple[str, ClipboardItem]] = []
@@ -1122,11 +1128,17 @@ class ClipPanel(QWidget):
         it = widget.itemAt(pos)
         if it is None:
             return
+        row = widget.row(it)
+        if row >= 0:
+            widget.setCurrentRow(row)
         item_obj: ClipboardItem | None = it.data(ROLE_ITEM)
         if item_obj is None:
             return
         menu = QMenu(widget)
         act_fav = menu.addAction("收藏/取消收藏")
+        act_edit = None
+        if item_obj.item_type == "text":
+            act_edit = menu.addAction("编辑文本")
         act_del = None
         act_up = None
         act_down = None
@@ -1137,12 +1149,92 @@ class ClipPanel(QWidget):
         chosen = menu.exec(widget.mapToGlobal(pos))
         if chosen == act_fav:
             self._toggle_current_favorite()
+        elif act_edit is not None and chosen == act_edit:
+            self._edit_current_text()
         elif act_del is not None and chosen == act_del:
             self._remove_current_favorite()
         elif act_up is not None and chosen == act_up:
             self._move_favorite(-1)
         elif act_down is not None and chosen == act_down:
             self._move_favorite(1)
+
+    def _edit_current_text(self) -> None:
+        if self._edit_item is None:
+            return
+        it = self._item_at_current_row()
+        if it is None or it.item_type != "text":
+            return
+
+        old_text = it.text or ""
+        new_text = self._open_text_edit_dialog(old_text)
+        if new_text is None or new_text == old_text:
+            return
+
+        updated = replace(it, text=new_text)
+        ok, msg = self._edit_item(it, updated)
+        if not ok:
+            QMessageBox.warning(self, "编辑失败", msg or "内容更新失败")
+            return
+
+        if self._get_favorites is not None:
+            try:
+                self._favorites = self._get_favorites()
+            except Exception:
+                pass
+        self._apply_filter()
+
+    def _open_text_edit_dialog(self, initial_text: str) -> str | None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("编辑文本")
+        dlg.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        dlg.resize(460, 280)
+
+        editor = QPlainTextEdit(dlg)
+        editor.setPlainText(initial_text)
+
+        btn_ok = QPushButton("确定", dlg)
+        btn_cancel = QPushButton("取消", dlg)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+        root.addWidget(editor)
+        root.addLayout(btn_row)
+
+        dlg.setStyleSheet(
+            """
+            QDialog { background: #FFFFFF; }
+            QPlainTextEdit {
+              border: 1px solid rgba(148, 163, 184, 0.65);
+              border-radius: 8px;
+              padding: 6px;
+              background: #FFFFFF;
+              color: #0F172A;
+            }
+            QPushButton {
+              min-width: 72px;
+              padding: 5px 12px;
+              border-radius: 8px;
+              border: 1px solid rgba(148, 163, 184, 0.45);
+              background: #FFFFFF;
+              color: #0F172A;
+            }
+            QPushButton:hover { background: #F8FAFC; }
+            """
+        )
+
+        editor.selectAll()
+        editor.setFocus()
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return editor.toPlainText()
 
     def _sync_status(self) -> None:
         self._status.setText("暂停" if self._paused else "监听中")
