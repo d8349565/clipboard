@@ -769,7 +769,7 @@ class ClipPanel(QWidget):
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         if event.type() == QEvent.Type.KeyPress:
-            key = getattr(event, "key", lambda: None)()
+            key = event.key()
             if key in (Qt.Key_Tab, Qt.Key_Backtab) and self._panel_has_focus():
                 self._cycle_tabs(1 if key == Qt.Key_Tab else -1)
                 return True
@@ -782,9 +782,9 @@ class ClipPanel(QWidget):
                     self._sync_hover_popup_from_cursor()
                 else:
                     self._hide_preview_popup()
-            elif event.type() == QEvent.Type.KeyPress and getattr(event, "key", lambda: None)() == Qt.Key_Control:
+            elif event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key_Control:
                 self._sync_hover_popup_from_cursor()
-            elif event.type() == QEvent.Type.KeyRelease and getattr(event, "key", lambda: None)() == Qt.Key_Control:
+            elif event.type() == QEvent.Type.KeyRelease and event.key() == Qt.Key_Control:
                 self._hide_preview_popup()
         return super().eventFilter(obj, event)
 
