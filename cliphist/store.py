@@ -19,6 +19,20 @@ class ClipboardHistory:
     def max_items(self) -> int:
         return self._max_items
 
+    def set_max_items(self, max_items: int) -> None:
+        if max_items <= 0:
+            raise ValueError("max_items must be > 0")
+        with self._lock:
+            if max_items == self._max_items:
+                return
+            items = list(self._items)[:max_items]
+            self._max_items = max_items
+            self._items = deque(items, maxlen=max_items)
+
+    def reset(self, items: list[ClipboardItem]) -> None:
+        with self._lock:
+            self._items = deque(items[: self._max_items], maxlen=self._max_items)
+
     def add(self, item: ClipboardItem) -> bool:
         with self._lock:
             if self._items and self._items[0].dedupe_key() == item.dedupe_key():

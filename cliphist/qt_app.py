@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
+from .autostart import is_autostart_enabled, set_autostart_enabled
 from .favorites import FavoritesStore
 from .hotkeys import HotkeySpec, parse_hotkey_sequence
 from .models import ClipboardItem
@@ -45,6 +46,13 @@ class ClipHistApp:
             log.debug("设置应用图标失败", exc_info=True)
 
         self.settings = load_settings()
+        actual_autostart = is_autostart_enabled()
+        if actual_autostart != self.settings.autostart_enabled:
+            self.settings = replace(self.settings, autostart_enabled=actual_autostart)
+            try:
+                save_settings(self.settings)
+            except Exception:
+                log.debug("同步开机自启设置失败", exc_info=True)
         self.paused = False
         self.history = ClipboardHistory(max_items=self.settings.max_items)
         self._store: SQLiteHistoryStore | None = None
@@ -147,7 +155,7 @@ class ClipHistApp:
         self.panel.toggle_visible()
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self._apply_hotkeys, parent=self.panel)
+        dlg = SettingsDialog(self.settings, self._apply_settings, parent=self.panel)
         dlg.exec()
 
     def _handle_event(self, evt: object) -> None:
@@ -392,6 +400,50 @@ class ClipHistApp:
         if save:
             self._save_hotkey_settings(show_seq, pause_seq)
 
+        self._sync_ui_state()
+        return True, warn
+
+    def _apply_settings(self, show_seq: str, pause_seq: str, max_items: int, autostart_enabled: bool) -> tuple[bool, str | None]:
+        max_items = max(1, int(max_items))
+
+        ok, warn = self._apply_hotkeys(show_seq, pause_seq, save=False)
+        if not ok:
+            return False, warn
+
+        if autostart_enabled != self.settings.autostart_enabled:
+            try:
+                set_autostart_enabled(autostart_enabled)
+            except Exception:
+                log.exception("更新开机自启设置失败")
+                return False, "热键已更新，但开机自启设置失败"
+
+        previous_max_items = self.history.max_items
+        if max_items != previous_max_items:
+            self.history.set_max_items(max_items)
+            if self._store is not None:
+                try:
+                    loaded = self._store.load_recent(max_items)
+                    self.history.reset(loaded)
+                except Exception:
+                    log.exception("更新历史条数后重新加载持久化历史失败")
+                    return False, "热键已更新，但重新加载历史失败"
+
+        self.settings = replace(
+            self.settings,
+            max_items=max_items,
+            autostart_enabled=autostart_enabled,
+            hotkey_show_panel=(show_seq or "").strip(),
+            hotkey_toggle_pause=(pause_seq or "").strip(),
+        )
+        try:
+            save_settings(self.settings)
+        except Exception:
+            log.exception("保存设置失败")
+            return False, "设置已应用，但保存到配置文件失败"
+
+        if self.panel.isVisible():
+            self.panel.set_items(self.history.items())
+            self.panel.set_favorites(self._get_favorites())
         self._sync_ui_state()
         return True, warn
 

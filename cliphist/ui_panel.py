@@ -146,7 +146,7 @@ def _clean_preview(item: ClipboardItem, max_len: int = 120) -> str:
 
 
 def _secondary_text(item: ClipboardItem) -> str:
-    ts = item.created_at.astimezone().strftime("%H:%M:%S")
+    ts = item.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     if item.item_type == "files":
         n = len(item.file_paths or ())
         return f"{ts} · {n} 个文件"
@@ -349,6 +349,8 @@ class _ClipItemDelegate(QStyledItemDelegate):
 
 
 class ClipPanel(QWidget):
+    _PAGE_SIZE = 100
+
     def __init__(
         self,
         on_activate: Callable[[ClipboardItem], None],
@@ -373,6 +375,8 @@ class ClipPanel(QWidget):
         self._filtered_items: list[ClipboardItem] = []
         self._favorites: list[tuple[str, ClipboardItem]] = []
         self._fav_filtered: list[tuple[str, ClipboardItem]] = []
+        self._all_page = 0
+        self._fav_page = 0
         self._paused = False
         self._drag_pos: QPoint | None = None
         self._hover_preview = True
@@ -445,6 +449,30 @@ class ClipPanel(QWidget):
 
         self._tabs.addTab(tab_all, "全部")
         self._tabs.addTab(tab_fav, "收藏")
+
+        pager = QHBoxLayout()
+        pager.setContentsMargins(0, 0, 0, 0)
+        pager.addStretch(1)
+
+        self._btn_prev_page = QToolButton(card)
+        self._btn_prev_page.setObjectName("btnIcon")
+        self._btn_prev_page.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
+        self._btn_prev_page.setToolTip("上一页")
+        self._btn_prev_page.setFixedSize(28, 28)
+        self._btn_prev_page.clicked.connect(lambda: self._change_page(-1))
+        pager.addWidget(self._btn_prev_page)
+
+        self._page_label = QLabel("第 0/0 页", card)
+        self._page_label.setObjectName("pageLabel")
+        pager.addWidget(self._page_label)
+
+        self._btn_next_page = QToolButton(card)
+        self._btn_next_page.setObjectName("btnIcon")
+        self._btn_next_page.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        self._btn_next_page.setToolTip("下一页")
+        self._btn_next_page.setFixedSize(28, 28)
+        self._btn_next_page.clicked.connect(lambda: self._change_page(1))
+        pager.addWidget(self._btn_next_page)
 
         self._preview = QFrame(card)
         self._preview.setObjectName("previewCard")
@@ -630,6 +658,7 @@ class ClipPanel(QWidget):
         body.addWidget(self._search)
         body.addLayout(toolbar)
         body.addWidget(self._tabs, 1)
+        body.addLayout(pager)
         body.addWidget(self._preview)
 
         root = QVBoxLayout(self)
@@ -779,18 +808,112 @@ class ClipPanel(QWidget):
         current.setFocus()
 
     def _is_preview_list_viewport(self, obj) -> bool:
-        return obj is self._list_all.viewport() or obj is self._list_fav.viewport()
+        return obj is self._current_list().viewport()
 
     def _hover_target_under_cursor(self) -> tuple[QListWidget, QListWidgetItem] | None:
         pos = QCursor.pos()
-        for widget in (self._list_all, self._list_fav):
-            vp = widget.viewport()
-            local = vp.mapFromGlobal(pos)
-            if vp.rect().contains(local):
-                it = widget.itemAt(local)
-                if it is not None:
-                    return widget, it
+        widget = self._current_list()
+        vp = widget.viewport()
+        local = vp.mapFromGlobal(pos)
+        if vp.rect().contains(local):
+            it = widget.itemAt(local)
+            if it is not None:
+                return widget, it
         return None
+
+    def _page_count_for(self, total: int) -> int:
+        if total <= 0:
+            return 0
+        return (total + self._PAGE_SIZE - 1) // self._PAGE_SIZE
+
+    def _get_page_index(self, favorites: bool) -> int:
+        return self._fav_page if favorites else self._all_page
+
+    def _set_page_index(self, favorites: bool, value: int) -> None:
+        if favorites:
+            self._fav_page = max(0, value)
+        else:
+            self._all_page = max(0, value)
+
+    def _page_start(self, favorites: bool) -> int:
+        return self._get_page_index(favorites) * self._PAGE_SIZE
+
+    def _clamp_page_index(self, total: int, favorites: bool) -> int:
+        page_count = self._page_count_for(total)
+        if page_count <= 0:
+            self._set_page_index(favorites, 0)
+            return 0
+        current = min(self._get_page_index(favorites), page_count - 1)
+        self._set_page_index(favorites, current)
+        return current
+
+    def _sync_pagination(self) -> None:
+        is_fav_tab = self._tabs.currentIndex() == 1
+        total = len(self._fav_filtered) if is_fav_tab else len(self._filtered_items)
+        page_count = self._page_count_for(total)
+        page_index = self._clamp_page_index(total, is_fav_tab)
+
+        if total <= 0 or page_count <= 0:
+            self._page_label.setText("第 0/0 页")
+            self._btn_prev_page.setEnabled(False)
+            self._btn_next_page.setEnabled(False)
+            return
+
+        self._page_label.setText(f"第 {page_index + 1}/{page_count} 页 · 共 {total} 条")
+        self._btn_prev_page.setEnabled(page_index > 0)
+        self._btn_next_page.setEnabled(page_index + 1 < page_count)
+
+    def _change_page(self, delta: int) -> None:
+        is_fav_tab = self._tabs.currentIndex() == 1
+        total = len(self._fav_filtered) if is_fav_tab else len(self._filtered_items)
+        page_count = self._page_count_for(total)
+        if page_count <= 1:
+            return
+
+        current = self._clamp_page_index(total, is_fav_tab)
+        target = max(0, min(page_count - 1, current + delta))
+        if target == current:
+            return
+
+        self._set_page_index(is_fav_tab, target)
+        self._refresh_lists()
+
+    def _refresh_lists(self) -> None:
+        fav_ids = {fid for fid, _ in self._favorites}
+        self._list_all.clear()
+        all_page = self._clamp_page_index(len(self._filtered_items), False)
+        all_start = all_page * self._PAGE_SIZE
+        all_end = all_start + self._PAGE_SIZE
+        for it in self._filtered_items[all_start:all_end]:
+            item = QListWidgetItem()
+            item.setData(ROLE_ITEM, it)
+            item.setData(ROLE_IS_FAVORITE, self._fav_id_for_item(it, fav_ids) is not None)
+            item.setData(ROLE_TITLE, _clean_preview(it, 150))
+            item.setData(ROLE_SUBTITLE, _secondary_text(it))
+            item.setToolTip(it.preview(10_000))
+            self._list_all.addItem(item)
+
+        self._list_fav.clear()
+        fav_page = self._clamp_page_index(len(self._fav_filtered), True)
+        fav_start = fav_page * self._PAGE_SIZE
+        fav_end = fav_start + self._PAGE_SIZE
+        for fid, it in self._fav_filtered[fav_start:fav_end]:
+            item = QListWidgetItem()
+            item.setData(ROLE_ITEM, it)
+            item.setData(ROLE_FAV_ID, fid)
+            item.setData(ROLE_IS_FAVORITE, True)
+            item.setData(ROLE_TITLE, _clean_preview(it, 150))
+            item.setData(ROLE_SUBTITLE, _secondary_text(it))
+            item.setToolTip(it.preview(10_000))
+            self._list_fav.addItem(item)
+
+        current = self._current_list()
+        if current.count() > 0:
+            current.setCurrentRow(0)
+
+        self._sync_tooltips()
+        self._sync_pagination()
+        self._update_preview()
 
     def _sync_hover_popup_from_cursor(self) -> None:
         if not self._hover_preview or not self.isVisible():
@@ -808,7 +931,6 @@ class ClipPanel(QWidget):
 
     def _apply_filter(self) -> None:
         q = (self._search.text() or "").strip().lower()
-        fav_ids = {fid for fid, _ in self._favorites}
         preview_lc_cache: dict[int, str] = {}
 
         def _preview_lc(it: ClipboardItem) -> str:
@@ -829,44 +951,10 @@ class ClipPanel(QWidget):
             self._filtered_items = self._all_items[:]
             self._fav_filtered = self._favorites[:]
         else:
-            self._filtered_items = [
-                it
-                for it in self._all_items
-                if _matches_query(it)
-            ]
-            self._fav_filtered = [
-                (fid, it)
-                for fid, it in self._favorites
-                if _matches_query(it)
-            ]
+            self._filtered_items = [it for it in self._all_items if _matches_query(it)]
+            self._fav_filtered = [(fid, it) for fid, it in self._favorites if _matches_query(it)]
 
-        self._list_all.clear()
-        for it in self._filtered_items:
-            item = QListWidgetItem()
-            item.setData(ROLE_ITEM, it)
-            item.setData(ROLE_IS_FAVORITE, self._fav_id_for_item(it, fav_ids) is not None)
-            item.setData(ROLE_TITLE, _clean_preview(it, 150))
-            item.setData(ROLE_SUBTITLE, _secondary_text(it))
-            item.setToolTip(it.preview(10_000))
-            self._list_all.addItem(item)
-
-        self._list_fav.clear()
-        for fid, it in self._fav_filtered:
-            item = QListWidgetItem()
-            item.setData(ROLE_ITEM, it)
-            item.setData(ROLE_FAV_ID, fid)
-            item.setData(ROLE_IS_FAVORITE, True)
-            item.setData(ROLE_TITLE, _clean_preview(it, 150))
-            item.setData(ROLE_SUBTITLE, _secondary_text(it))
-            item.setToolTip(it.preview(10_000))
-            self._list_fav.addItem(item)
-
-        if self._tabs.currentIndex() == 0 and self._filtered_items:
-            self._list_all.setCurrentRow(0)
-        if self._tabs.currentIndex() == 1 and self._fav_filtered:
-            self._list_fav.setCurrentRow(0)
-        self._sync_tooltips()
-        self._update_preview()
+        self._refresh_lists()
 
     def _update_preview(self) -> None:
         it = self._item_at_current_row()
@@ -1022,14 +1110,16 @@ class ClipPanel(QWidget):
             self._update_preview()
 
     def _get_filtered_item(self, row: int) -> ClipboardItem | None:
-        if row < 0 or row >= len(self._filtered_items):
+        item = self._list_all.item(row)
+        if item is None:
             return None
-        return self._filtered_items[row]
+        return item.data(ROLE_ITEM)
 
     def _get_fav_filtered_item(self, row: int) -> ClipboardItem | None:
-        if row < 0 or row >= len(self._fav_filtered):
+        item = self._list_fav.item(row)
+        if item is None:
             return None
-        return self._fav_filtered[row][1]
+        return item.data(ROLE_ITEM)
 
     def _activate_current(self) -> None:
         w = self._current_list()
@@ -1046,22 +1136,18 @@ class ClipPanel(QWidget):
         return self._list_fav if self._tabs.currentIndex() == 1 else self._list_all
 
     def _item_at_current_row(self) -> ClipboardItem | None:
-        row = self._current_list().currentRow()
-        if self._tabs.currentIndex() == 1:
-            if row < 0 or row >= len(self._fav_filtered):
-                return None
-            return self._fav_filtered[row][1]
-        if row < 0 or row >= len(self._filtered_items):
+        current_item = self._current_list().currentItem()
+        if current_item is None:
             return None
-        return self._filtered_items[row]
+        return current_item.data(ROLE_ITEM)
 
     def _fav_id_at_current_row(self) -> str | None:
         if self._tabs.currentIndex() != 1:
             return None
-        row = self._list_fav.currentRow()
-        if row < 0 or row >= len(self._fav_filtered):
+        current_item = self._list_fav.currentItem()
+        if current_item is None:
             return None
-        return self._fav_filtered[row][0]
+        return current_item.data(ROLE_FAV_ID)
 
     def _toggle_current_favorite(self) -> None:
         it = self._item_at_current_row()
@@ -1091,22 +1177,26 @@ class ClipPanel(QWidget):
         if self._tabs.currentIndex() != 1 or self._reorder_favorites is None:
             return
         row = self._list_fav.currentRow()
-        if row < 0 or row >= len(self._fav_filtered):
+        if row < 0:
             return
-        target = row + delta
+        global_row = self._page_start(True) + row
+        if global_row < 0 or global_row >= len(self._fav_filtered):
+            return
+        target = global_row + delta
         if target < 0 or target >= len(self._fav_filtered):
             return
         ids = [fid for fid, _ in self._fav_filtered]
-        ids[row], ids[target] = ids[target], ids[row]
+        ids[global_row], ids[target] = ids[target], ids[global_row]
         self._reorder_favorites(ids)
         if self._get_favorites is not None:
             try:
                 self._favorites = self._get_favorites()
             except Exception:
                 pass
+        self._fav_page = target // self._PAGE_SIZE
         self._apply_filter()
         self._tabs.setCurrentIndex(1)
-        self._list_fav.setCurrentRow(target)
+        self._list_fav.setCurrentRow(target % self._PAGE_SIZE)
 
     def _on_tab_changed(self) -> None:
         self._sync_tooltips()
@@ -1282,6 +1372,11 @@ class ClipPanel(QWidget):
               background: rgba(239, 68, 68, 0.16);
               color: #991B1B;
             }
+                        QLabel#pageLabel {
+                            color: #64748B;
+                            font-size: 12px;
+                            padding: 0 4px;
+                        }
             QLineEdit {
               padding: 8px 12px;
               border-radius: 10px;

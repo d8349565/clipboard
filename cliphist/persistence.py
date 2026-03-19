@@ -98,12 +98,12 @@ class SQLiteHistoryStore:
             self._do_insert(item)
         self._conn.commit()
 
-    def load_recent(self, limit: int) -> list[ClipboardItem]:
+    def load_recent(self, limit: int, offset: int = 0) -> list[ClipboardItem]:
         if limit <= 0:
             return []
         cur = self._conn.execute(
-            "SELECT created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes FROM clipboard_items ORDER BY created_at_ms DESC LIMIT ?",
-            (limit,),
+            "SELECT created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes FROM clipboard_items ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
         items: list[ClipboardItem] = []
         for created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes in cur.fetchall():
@@ -125,6 +125,11 @@ class SQLiteHistoryStore:
                 )
             )
         return items
+
+    def count(self) -> int:
+        cur = self._conn.execute("SELECT COUNT(*) FROM clipboard_items")
+        row = cur.fetchone()
+        return row[0] if row else 0
 
 
 def _coerce_item_type(v: str) -> ClipboardItemType:

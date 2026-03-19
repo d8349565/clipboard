@@ -5,8 +5,8 @@ from typing import Callable
 from PySide6.QtCore import Qt, QPoint
 from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
+  QCheckBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -15,22 +15,23 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QKeySequenceEdit,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .settings import AppSettings
+from .settings import AppSettings, MAX_ITEMS_LIMIT
 
 
-ApplyHotkeys = Callable[[str, str], tuple[bool, str | None]]
+ApplySettings = Callable[[str, str, int, bool], tuple[bool, str | None]]
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: AppSettings, apply_hotkeys: ApplyHotkeys, parent: QWidget | None = None) -> None:
+    def __init__(self, settings: AppSettings, apply_settings: ApplySettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._settings = settings
-        self._apply_hotkeys = apply_hotkeys
+        self._apply_settings = apply_settings
         self._drag_pos: QPoint | None = None
 
         self.setWindowTitle("设置")
@@ -64,14 +65,22 @@ class SettingsDialog(QDialog):
         # -- form --
         self._hotkey_show = QKeySequenceEdit(card)
         self._hotkey_pause = QKeySequenceEdit(card)
+        self._max_items = QSpinBox(card)
+        self._autostart = QCheckBox("开机自动启动 ClipHist", card)
         self._hotkey_show.setKeySequence(QKeySequence(settings.hotkey_show_panel))
         self._hotkey_pause.setKeySequence(QKeySequence(settings.hotkey_toggle_pause))
+        self._max_items.setRange(50, MAX_ITEMS_LIMIT)
+        self._max_items.setSingleStep(50)
+        self._max_items.setValue(settings.max_items)
+        self._autostart.setChecked(settings.autostart_enabled)
 
         form = QFormLayout()
         form.addRow("打开面板：", self._hotkey_show)
         form.addRow("暂停监听：", self._hotkey_pause)
+        form.addRow("历史条数：", self._max_items)
+        form.addRow("开机自启：", self._autostart)
 
-        hint = QLabel("仅支持 Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24/方向键等常见组合键。", card)
+        hint = QLabel("仅支持 Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24/方向键等常见组合键。历史条数决定当前会加载多少条历史记录；开机自启会在 Windows 启动目录创建或移除快捷方式。", card)
         hint.setWordWrap(True)
         hint.setObjectName("settingsHint")
 
@@ -107,7 +116,7 @@ class SettingsDialog(QDialog):
         root.addWidget(card)
         self.setLayout(root)
 
-        self.resize(440, 230)
+        self.resize(460, 300)
         self._apply_styles()
 
     def _apply_styles(self) -> None:
@@ -147,12 +156,22 @@ class SettingsDialog(QDialog):
               border: 1px solid rgba(148, 163, 184, 0.6);
               background: #FFFFFF;
             }
-            QKeySequenceEdit:focus {
+            QKeySequenceEdit:focus, QSpinBox:focus {
               border: 1px solid #3B82F6;
               background: #F8FAFC;
             }
+            QSpinBox {
+              padding: 6px 10px;
+              border-radius: 8px;
+              border: 1px solid rgba(148, 163, 184, 0.6);
+              background: #FFFFFF;
+            }
             QLabel {
               color: #0F172A;
+            }
+            QCheckBox {
+              color: #0F172A;
+              spacing: 8px;
             }
             QPushButton#settingsBtn {
               padding: 6px 16px;
@@ -213,6 +232,8 @@ class SettingsDialog(QDialog):
     def _reset_defaults(self) -> None:
         self._hotkey_show.setKeySequence(QKeySequence("Alt+C"))
         self._hotkey_pause.setKeySequence(QKeySequence("Alt+P"))
+        self._max_items.setValue(5000)
+        self._autostart.setChecked(False)
 
     def _on_ok(self) -> None:
         show_seq = self._hotkey_show.keySequence().toString(QKeySequence.PortableText).strip()
@@ -222,7 +243,7 @@ class SettingsDialog(QDialog):
         if pause_seq == "None":
             pause_seq = ""
 
-        ok, msg = self._apply_hotkeys(show_seq, pause_seq)
+        ok, msg = self._apply_settings(show_seq, pause_seq, int(self._max_items.value()), self._autostart.isChecked())
         if not ok:
             QMessageBox.warning(self, "设置", msg or "保存失败")
             return

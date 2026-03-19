@@ -5,6 +5,8 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 
+from .autostart import is_autostart_enabled
+
 log = logging.getLogger(__name__)
 
 
@@ -13,8 +15,9 @@ MAX_ITEMS_LIMIT: int = 10000
 
 @dataclass(frozen=True, slots=True)
 class AppSettings:
-    max_items: int = 200
+    max_items: int = 5000
     persist_enabled: bool = False
+    autostart_enabled: bool = False
     db_path: str | None = None
     hotkey_show_panel: str = "Alt+C"
     hotkey_toggle_pause: str = "Alt+P"
@@ -41,17 +44,19 @@ def load_settings() -> AppSettings:
     except Exception:
         data = {}
 
-    max_items = int(data.get("max_items", 200))
+    max_items = int(data.get("max_items", 5000))
     if max_items <= 0:
-        max_items = 200
+        max_items = 5000
     max_items = min(max_items, MAX_ITEMS_LIMIT)
     persist_enabled = bool(data.get("persist_enabled", False))
+    autostart_enabled = bool(data.get("autostart_enabled", is_autostart_enabled()))
     db_path = data.get("db_path") or None
     hotkey_show_panel = str(data.get("hotkey_show_panel") or "Alt+C")
     hotkey_toggle_pause = str(data.get("hotkey_toggle_pause") or "Alt+P")
     return AppSettings(
         max_items=max_items,
         persist_enabled=persist_enabled,
+        autostart_enabled=autostart_enabled,
         db_path=db_path,
         hotkey_show_panel=hotkey_show_panel,
         hotkey_toggle_pause=hotkey_toggle_pause,
