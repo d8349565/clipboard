@@ -1,3 +1,6 @@
+﻿# ClipHist Windows Build Script
+# UTF-8 with BOM
+
 param(
     [string]$Python = "python",
     [switch]$UseUpx = $true
@@ -8,7 +11,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
-# ── 1. 创建干净的虚拟环境（体积更小） ──
+# 1. Create clean venv for smaller build size
 $venvDir = Join-Path $projectRoot ".build_venv"
 if (Test-Path $venvDir) {
     Write-Host "Removing previous build venv..."
@@ -24,7 +27,7 @@ Write-Host "Installing build dependencies into venv..."
 & $venvPython -m pip install -r requirements.txt --quiet
 & $venvPython -m pip install pyinstaller --quiet
 
-# ── 2. 生成图标（如果不存在） ──
+# 2. Generate icon if not exists
 $iconPath = Join-Path $projectRoot "assets\icon.ico"
 if (-not (Test-Path $iconPath)) {
     Write-Host "Generating application icon..."
@@ -35,7 +38,7 @@ if (-not (Test-Path $iconPath)) {
     }
 }
 
-# ── 3. 清理旧产物 ──
+# 3. Clean old build output
 Write-Host "Cleaning old build output..."
 Remove-Item -Recurse -Force "$projectRoot\build" -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force "$projectRoot\dist" -ErrorAction SilentlyContinue
@@ -50,10 +53,18 @@ $pyinstallerArgs = @(
     "--optimize", "2"
 )
 
-# 添加图标参数
+# Icon parameter (Windows uses semicolon separator)
 if ($iconPath -and (Test-Path $iconPath)) {
     $pyinstallerArgs += @("--icon", $iconPath)
-    $pyinstallerArgs += @("--add-data", "$iconPath;assets")
+    $iconData = $iconPath + ";assets"
+    $pyinstallerArgs += @("--add-data", $iconData)
+}
+
+# PySide6 plugins and data
+$pysidePluginsSrc = $env:PYTHONHOME + "\Lib\site-packages\PySide6\plugins"
+if (Test-Path $pysidePluginsSrc) {
+    $pysideData = $pysidePluginsSrc + ";PySide6\plugins"
+    $pyinstallerArgs += @("--add-data", $pysideData)
 }
 
 $pyinstallerArgs += @(
@@ -110,6 +121,16 @@ $pyinstallerArgs += @(
     "--exclude-module", "PySide6.QtWebSockets",
     "--exclude-module", "PySide6.QtXml",
     "--exclude-module", "PySide6.QtXmlPatterns",
+    # Hidden imports for pywin32
+    "--hidden-import", "win32api",
+    "--hidden-import", "win32gui",
+    "--hidden-import", "win32con",
+    "--hidden-import", "win32clipboard",
+    "--hidden-import", "win32com",
+    "--hidden-import", "win32com.client",
+    "--hidden-import", "win32com.gen_py",
+    "--hidden-import", "pythoncom",
+    "--hidden-import", "pywintypes",
     "run.py"
 )
 
@@ -131,19 +152,19 @@ if ($UseUpx) {
     }
 
     if ($upxExe) {
-        Write-Host "Compressing with UPX (--best --lzma)..."
-        & $upxExe "--best" "--lzma" $exePath
+        Write-Host "Compressing with UPX (--best --lzma --force)..."
+        & $upxExe "--best" "--lzma" "--force" $exePath
         if ($LASTEXITCODE -ne 0) {
             Write-Warning "UPX compression failed. Keeping uncompressed executable."
         }
     } else {
-        Write-Warning "UPX not found (PATH or .tools\\upx-4.2.4). Skipping UPX compression."
+        Write-Warning "UPX not found (PATH or .tools\upx-4.2.4). Skipping UPX compression."
     }
 }
 
 $sizeMB = [math]::Round(((Get-Item $exePath).Length / 1MB), 2)
 Write-Host "Done: $exePath ($sizeMB MB)"
 
-# ── 清理构建用虚拟环境 ──
+# Cleanup build venv
 Write-Host "Cleaning up build venv..."
 Remove-Item -Recurse -Force $venvDir -ErrorAction SilentlyContinue
