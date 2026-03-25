@@ -1,7 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Bash(gh pr:*)"
+      "Bash(gh pr:*)",
+      "Bash(powershell -Command \"try { . .\\\\build_windows.ps1 -WhatIf 2>&1 | Out-Null } catch { $_.Exception.Message }\")",
+      "Bash(powershell -Command \"$content = Get-Content -Path ''build_windows.ps1'' -Raw -Encoding UTF8; $content.Substring\\(0, 2000\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(powershell -Command \"$errors = $null; $null = [System.Management.Automation.PSParser]::Tokenize\\(\\(Get-Content -Path ''build_windows.ps1'' -Raw\\), [ref]$errors\\); $errors\")",
+      "Bash(powershell -Command 'Get-Content -Path \"\"build_windows.ps1\"\" -Raw')",
+      "Bash(pip install:*)",
+      "Bash(pyinstaller --clean --windowed --onefile --name ClipHist --optimize 2 run.py)",
+      "Bash(powershell -ExecutionPolicy Bypass -File build_windows.ps1 -WhatIf)",
+      "Bash(powershell -Command '$null = [System.Management.Automation.PSParser]::Tokenize\\(\\(Get-Content -Path \"\"build_windows.ps1\"\" -Raw -Encoding UTF8\\), [ref]$null\\); Write-Host \"\"Syntax OK\"\"')",
+      "Bash(powershell -ExecutionPolicy Bypass -File build_windows.ps1)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

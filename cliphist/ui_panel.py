@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizeGrip,
     QStyle,
     QStyledItemDelegate,
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import re
+
 from .models import ClipboardItem
 from .text_util import (
     _RE_RTF_CTRL,
@@ -40,11 +43,354 @@ from .text_util import (
     rtf_to_plain_text,
 )
 
+_RE_URL = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+', re.IGNORECASE)
+
 ROLE_ITEM = int(Qt.UserRole)
 ROLE_FAV_ID = int(Qt.UserRole + 1)
 ROLE_IS_FAVORITE = int(Qt.UserRole + 2)
 ROLE_TITLE = int(Qt.UserRole + 3)
 ROLE_SUBTITLE = int(Qt.UserRole + 4)
+
+
+_HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
+    (
+        "🚀", "快速上手",
+        [
+            ("启动", "程序启动后最小化至系统托盘，不占用任务栏。"),
+            ("打开面板", "按 Alt+C（默认）或双击托盘图标，面板会在鼠标附近弹出。"),
+            ("使用记录", "双击列表项或选中后按 Enter，即可将内容重新写入剪切板并自动关闭面板。"),
+            ("关闭面板", "按 Esc 或点击右上角 ✕，面板隐藏到后台，程序继续监听剪切板。"),
+        ],
+    ),
+    (
+        "📋", "剪切板记录",
+        [
+            ("自动捕获", "复制任意内容（文字、图片、文件、HTML、RTF）后，ClipHist 自动保存至历史顶部。"),
+            ("支持类型", "文本 · 链接 · 图片（位图）· 文件路径 · HTML 富文本 · RTF 富文本。"),
+            ("自动去重", "连续复制相同内容只保留一条，不会重复叠加。"),
+            ("容量上限", "默认保存最近 5000 条，可在设置中调整（最多 10000 条）。"),
+            ("暂停监听", "按 Alt+P 或托盘菜单「暂停」，暂停期间复制的内容不会被记录。"),
+        ],
+    ),
+    (
+        "🔍", "搜索与筛选",
+        [
+            ("关键词搜索", "在顶部搜索框输入文字，列表实时筛选匹配内容（支持文件路径搜索）。"),
+            ("聚焦搜索框", "按 Ctrl+F 快速聚焦搜索框并全选已有文字。"),
+            ("类别标签", "搜索框下方有「全部 / 文本 / 图片 / 文件 / 链接 / HTML / RTF」标签，点击过滤类型。"),
+            ("组合筛选", "类别标签与关键词可同时生效，例如在「图片」类中搜索特定内容。"),
+        ],
+    ),
+    (
+        "⌨️", "快捷键一览",
+        [
+            ("Alt+C", "打开 / 隐藏主面板（可在设置中自定义）。"),
+            ("Alt+P", "切换暂停 / 继续监听（可在设置中自定义）。"),
+            ("Enter / 双击", "将选中记录写入剪切板并关闭面板。"),
+            ("Esc", "隐藏面板。"),
+            ("Ctrl+F", "聚焦搜索框。"),
+            ("Alt+F", "收藏 / 取消收藏当前选中的记录。"),
+            ("Tab / Shift+Tab", "在「全部」与「收藏」标签页之间循环切换。"),
+            ("Ctrl+悬停", "按住 Ctrl 后将鼠标悬停在列表项上，弹出浮动内容预览。"),
+        ],
+    ),
+    (
+        "★", "收藏功能",
+        [
+            ("添加收藏", "选中记录后按 Alt+F，或点击工具栏星号按钮，或右键菜单选择「收藏」。"),
+            ("查看收藏", "点击「收藏」标签页，收藏内容持久保存，不受历史上限影响。"),
+            ("删除收藏", "在收藏标签页选中记录后，点击工具栏垃圾桶按钮或右键「删除收藏」。"),
+            ("调整顺序", "选中记录后点击 ▲ / ▼ 按钮，或右键「上移 / 下移」调整收藏排序。"),
+            ("编辑文本", "对文本类收藏右键选择「编辑文本」，可直接修改内容后保存。"),
+        ],
+    ),
+    (
+        "👁", "预览功能",
+        [
+            ("底部预览", "点击工具栏预览按钮切换到底部预览模式，选中记录后在面板下方显示完整内容。"),
+            ("悬浮预览", "默认为悬浮模式，按住 Ctrl 悬停在列表项上弹出浮动预览窗口。"),
+            ("图片预览", "图片类记录在列表中显示缩略图，预览区显示完整图片并随窗口自动缩放。"),
+            ("富文本", "HTML / RTF 内容自动转换为纯文本预览，防止渲染异常。"),
+        ],
+    ),
+    (
+        "⚙️", "设置说明",
+        [
+            ("打开设置", "点击工具栏右侧齿轮按钮，或托盘右键菜单「设置」。"),
+            ("自定义热键", "支持 Ctrl / Alt / Shift / Win 与字母、数字、方向键、F1–F24 的组合。"),
+            ("历史条数", "最大保存条数（50–10000），超出后自动淘汰最旧的记录。"),
+            ("开机自启", "勾选后在 Windows 启动文件夹创建快捷方式，开机自动运行。"),
+            ("窗口大小", "可设置面板初始宽度（400–1600 px）和高度（350–1200 px），保存后立即生效。"),
+            ("持久化存储", "托盘菜单「启用持久化」后，历史写入 SQLite 数据库，重启不丢失。"),
+        ],
+    ),
+    (
+        "💡", "实用技巧",
+        [
+            ("拖拽使用", "直接把列表项拖拽到其他应用（文本→编辑器、图片→画图软件等）。"),
+            ("移动窗口", "拖动面板顶部标题栏可移动窗口；右下角拖动手柄可调整大小。"),
+            ("分页浏览", "历史记录过多时，列表底部显示分页控件，可快速跳转到上一页 / 下一页。"),
+            ("清空历史", "工具栏垃圾桶按钮可清空全部历史，收藏内容不受影响。"),
+            ("数据位置", "配置文件和数据库位于 %APPDATA%\\ClipHist，可手动备份或迁移。"),
+        ],
+    ),
+]
+
+
+class HelpDialog(QDialog):
+    """使用指南对话框。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("使用指南")
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self._drag_pos: QPoint | None = None
+
+        card = QFrame(self)
+        card.setObjectName("helpCard")
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(0, 0, 0, 100))
+        card.setGraphicsEffect(shadow)
+
+        # ── Title bar ──
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(8)
+
+        icon_lbl = QLabel("?", card)
+        icon_lbl.setObjectName("helpIcon")
+        icon_lbl.setFixedSize(32, 32)
+        icon_lbl.setAlignment(Qt.AlignCenter)
+        title_bar.addWidget(icon_lbl)
+
+        title_lbl = QLabel("ClipHist 使用指南", card)
+        title_lbl.setObjectName("helpTitle")
+        title_bar.addWidget(title_lbl)
+        title_bar.addStretch(1)
+
+        ver_lbl = QLabel("v0.1", card)
+        ver_lbl.setObjectName("helpVer")
+        title_bar.addWidget(ver_lbl)
+
+        btn_close = QToolButton(card)
+        btn_close.setObjectName("btnWinControl")
+        btn_close.setText("✕")
+        btn_close.setFixedSize(28, 28)
+        btn_close.clicked.connect(self.accept)
+        title_bar.addWidget(btn_close)
+
+        # ── Separator ──
+        sep = QFrame(card)
+        sep.setFrameShape(QFrame.HLine)
+        sep.setObjectName("helpSep")
+
+        # ── Scrollable content ──
+        scroll = QScrollArea(card)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setObjectName("helpScroll")
+
+        content = QWidget()
+        content.setObjectName("helpContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(4, 4, 8, 4)
+        content_layout.setSpacing(10)
+
+        for emoji, section_title, items in _HELP_SECTIONS:
+            content_layout.addWidget(self._build_section(content, emoji, section_title, items))
+
+        content_layout.addStretch(1)
+        content.setLayout(content_layout)
+        scroll.setWidget(content)
+
+        # ── Footer ──
+        footer = QLabel(
+            "数据目录：<b>%APPDATA%\\ClipHist</b>　·　托盘右键菜单可快速访问所有功能",
+            card,
+        )
+        footer.setObjectName("helpFooter")
+        footer.setWordWrap(True)
+
+        body = QVBoxLayout(card)
+        body.setContentsMargins(20, 16, 20, 18)
+        body.setSpacing(10)
+        body.addLayout(title_bar)
+        body.addWidget(sep)
+        body.addWidget(scroll, 1)
+        body.addWidget(footer)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.addWidget(card)
+
+        self.resize(560, 640)
+        self._apply_styles()
+
+    def _build_section(self, parent: QWidget, emoji: str, title: str, items: list[tuple[str, str]]) -> QFrame:
+        frame = QFrame(parent)
+        frame.setObjectName("helpSection")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setSpacing(7)
+
+        header = QHBoxLayout()
+        header.setSpacing(7)
+        emoji_lbl = QLabel(emoji, frame)
+        emoji_lbl.setObjectName("helpEmoji")
+        emoji_lbl.setFixedWidth(22)
+        title_lbl = QLabel(title, frame)
+        title_lbl.setObjectName("helpSectionTitle")
+        header.addWidget(emoji_lbl)
+        header.addWidget(title_lbl)
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        for term, desc in items:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            row.setContentsMargins(4, 0, 0, 0)
+            term_lbl = QLabel(term, frame)
+            term_lbl.setObjectName("helpTerm")
+            term_lbl.setFixedWidth(86)
+            term_lbl.setAlignment(Qt.AlignRight | Qt.AlignTop)
+            term_lbl.setWordWrap(False)
+            desc_lbl = QLabel(desc, frame)
+            desc_lbl.setObjectName("helpDesc")
+            desc_lbl.setWordWrap(True)
+            row.addWidget(term_lbl)
+            row.addWidget(desc_lbl, 1)
+            layout.addLayout(row)
+
+        return frame
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            #helpCard {
+              background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                          stop:0 #F8FAFC, stop:1 #EEF2FF);
+              border: 1px solid rgba(148, 163, 184, 0.4);
+              border-radius: 16px;
+            }
+            #helpIcon {
+              background: #2563EB;
+              color: #FFFFFF;
+              font-size: 18px;
+              font-weight: 900;
+              border-radius: 10px;
+            }
+            #helpTitle {
+              font-size: 15px;
+              font-weight: 700;
+              color: #0F172A;
+            }
+            #helpVer {
+              font-size: 11px;
+              color: #94A3B8;
+              padding: 2px 7px;
+              border: 1px solid rgba(148,163,184,0.4);
+              border-radius: 8px;
+              background: #FFFFFF;
+            }
+            #helpSep {
+              border: none;
+              border-top: 1px solid rgba(148, 163, 184, 0.35);
+              margin: 0 -4px;
+            }
+            #helpScroll { background: transparent; }
+            QScrollBar:vertical {
+              border: none;
+              background: transparent;
+              width: 6px;
+              margin: 0;
+            }
+            QScrollBar::handle:vertical {
+              background: rgba(148, 163, 184, 0.5);
+              border-radius: 3px;
+              min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover {
+              background: rgba(100, 116, 139, 0.65);
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            #helpContent { background: transparent; }
+            #helpSection {
+              background: #FFFFFF;
+              border: 1px solid rgba(148, 163, 184, 0.28);
+              border-radius: 12px;
+            }
+            #helpEmoji { font-size: 15px; }
+            #helpSectionTitle {
+              font-size: 13px;
+              font-weight: 700;
+              color: #1E3A5F;
+            }
+            #helpTerm {
+              font-size: 11px;
+              font-weight: 600;
+              color: #1D4ED8;
+              padding: 2px 6px;
+              background: rgba(219, 234, 254, 0.7);
+              border-radius: 5px;
+              margin-top: 1px;
+            }
+            #helpDesc {
+              font-size: 12px;
+              color: #334155;
+            }
+            #helpFooter {
+              font-size: 11px;
+              color: #94A3B8;
+              padding-top: 2px;
+            }
+            QToolButton#btnWinControl {
+              font-size: 14px;
+              font-weight: 700;
+              padding: 0px;
+              border-radius: 14px;
+              border: none;
+              background: transparent;
+              color: #64748B;
+            }
+            QToolButton#btnWinControl:hover {
+              background: rgba(148, 163, 184, 0.28);
+              color: #0F172A;
+            }
+            """
+        )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self.parent() is not None:
+            p = self.parent()
+            cx = p.x() + (p.width() - self.width()) // 2
+            cy = p.y() + (p.height() - self.height()) // 2
+            self.move(cx, cy)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and int(event.position().y()) <= 52:
+            self._drag_pos = QPoint(int(event.globalPosition().x()), int(event.globalPosition().y()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
+            cur = QPoint(int(event.globalPosition().x()), int(event.globalPosition().y()))
+            self.move(self.pos() + cur - self._drag_pos)
+            self._drag_pos = cur
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_pos = None
+        super().mouseReleaseEvent(event)
 
 
 class _ClipListWidget(QListWidget):
@@ -170,20 +516,23 @@ class _RowModel:
 
 
 class _ClipItemDelegate(QStyledItemDelegate):
-    _TYPE_COLORS: dict[str, QColor] = {
-        "text": QColor("#E0F2FE"),
-        "files": QColor("#ECFDF3"),
-        "image": QColor("#FEF3C7"),
-        "html": QColor("#FCE7F3"),
-        "rtf": QColor("#EDE9FE"),
+    _TYPE_COLORS: dict[str, tuple[QColor, QColor, QColor]] = {
+        # (background, border, foreground)
+        "text": (QColor("#DBEAFE"), QColor("#93C5FD"), QColor("#1E40AF")),
+        "files": (QColor("#DCFCE7"), QColor("#86EFAC"), QColor("#166534")),
+        "image": (QColor("#FEF9C3"), QColor("#FDE047"), QColor("#854D0E")),
+        "html": (QColor("#FCE7F3"), QColor("#F9A8D4"), QColor("#9D174D")),
+        "rtf": (QColor("#F3E8FF"), QColor("#D8B4FE"), QColor("#7E22CE")),
+        "link": (QColor("#CFFAFE"), QColor("#67E8F9"), QColor("#155E75")),
     }
-    _DEFAULT_TYPE_COLOR = QColor("#E2E8F0")
-    _TYPE_SYMBOLS: dict[str, str] = {
-        "text": "T",
-        "files": "F",
-        "image": "I",
-        "html": "H",
-        "rtf": "R",
+    _DEFAULT_TYPE_COLOR = (QColor("#F1F5F9"), QColor("#CBD5E1"), QColor("#475569"))
+    _TYPE_LABELS: dict[str, str] = {
+        "text": "文本",
+        "files": "文件",
+        "image": "图片",
+        "html": "HTML",
+        "rtf": "RTF",
+        "link": "链接",
     }
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -249,30 +598,44 @@ class _ClipItemDelegate(QStyledItemDelegate):
         if is_selected:
             painter.fillRect(QRect(rect.left(), rect.top(), 4, rect.height()), QColor("#60A5FA"))
 
-        badge_size = 34
         left_pad = 12
+        # Determine display type (detect links in text items)
+        display_type = it.item_type
+        if it.item_type == "text" and it.text and _RE_URL.search(it.text):
+            display_type = "link"
+
+        badge_h = 22
+        badge_w = 46
         badge_rect = QRect(
             rect.left() + left_pad,
-            rect.top() + (rect.height() - badge_size) // 2,
-            badge_size,
-            badge_size,
+            rect.top() + (rect.height() - badge_h) // 2,
+            badge_w,
+            badge_h,
         )
         if it.item_type == "image":
-            thumb = self._image_thumb(it, badge_size - 4)
+            thumb_size = 34
+            thumb_rect = QRect(
+                rect.left() + left_pad,
+                rect.top() + (rect.height() - thumb_size) // 2,
+                thumb_size,
+                thumb_size,
+            )
+            thumb = self._image_thumb(it, thumb_size - 4)
             if thumb is not None:
                 clip = QPainterPath()
-                clip.addRoundedRect(badge_rect, 8, 8)
+                clip.addRoundedRect(thumb_rect, 8, 8)
                 painter.setClipPath(clip)
-                painter.drawPixmap(badge_rect, thumb)
+                painter.drawPixmap(thumb_rect, thumb)
                 painter.setClipping(False)
                 painter.setPen(QColor(15, 23, 42, 40))
-                painter.drawRoundedRect(badge_rect.adjusted(0, 0, -1, -1), 8, 8)
+                painter.drawRoundedRect(thumb_rect.adjusted(0, 0, -1, -1), 8, 8)
+                badge_rect = thumb_rect
             else:
-                self._paint_icon_badge(painter, badge_rect, it, is_selected)
+                self._paint_icon_badge(painter, badge_rect, display_type, is_selected)
         else:
-            self._paint_icon_badge(painter, badge_rect, it, is_selected)
+            self._paint_icon_badge(painter, badge_rect, display_type, is_selected)
 
-        x0 = badge_rect.right() + 12
+        x0 = badge_rect.right() + 10
         x1 = rect.right() - 14 - 20
         w = max(0, x1 - x0)
         y0 = rect.top() + 8
@@ -328,24 +691,30 @@ class _ClipItemDelegate(QStyledItemDelegate):
         self,
         painter: QPainter,
         rect: QRect,
-        it: ClipboardItem,
+        display_type: str,
         is_selected: bool,
     ) -> None:
-        bg = QColor(255, 255, 255, 60) if is_selected else self._type_color(it.item_type)
-        painter.setBrush(bg)
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(rect)
+        colors = self._TYPE_COLORS.get(display_type, self._DEFAULT_TYPE_COLOR)
+        if is_selected:
+            bg = QColor(255, 255, 255, 45)
+            border = QColor(255, 255, 255, 80)
+            fg = QColor("#FFFFFF")
+        else:
+            bg, border, fg = colors
 
-        symbol = self._TYPE_SYMBOLS.get(it.item_type, "?")
+        radius = 6
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(bg)
+        painter.setPen(border)
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), radius, radius)
+
+        label = self._TYPE_LABELS.get(display_type, display_type[:3])
         font = painter.font()
         font.setBold(True)
-        font.setPointSize(max(8, font.pointSize() - 1))
+        font.setPixelSize(11)
         painter.setFont(font)
-        painter.setPen(QColor("#0F172A") if not is_selected else QColor("#FFFFFF"))
-        painter.drawText(rect, Qt.AlignCenter, symbol)
-
-    def _type_color(self, item_type: str) -> QColor:
-        return self._TYPE_COLORS.get(item_type, self._DEFAULT_TYPE_COLOR)
+        painter.setPen(fg)
+        painter.drawText(rect, Qt.AlignCenter, label)
 
 
 class ClipPanel(QWidget):
@@ -380,6 +749,7 @@ class ClipPanel(QWidget):
         self._paused = False
         self._drag_pos: QPoint | None = None
         self._hover_preview = True
+        self._active_category: str = "all"  # "all", "text", "image", "files", "link", "html", "rtf"
 
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -401,6 +771,33 @@ class ClipPanel(QWidget):
         self._filter_timer.setInterval(150)  # 150ms debounce
         self._filter_timer.timeout.connect(self._apply_filter)
         self._search.textChanged.connect(lambda: self._filter_timer.start())
+
+        # ── Category filter chips ──
+        self._category_row = QHBoxLayout()
+        self._category_row.setSpacing(6)
+        self._category_row.setContentsMargins(0, 0, 0, 0)
+        self._category_buttons: dict[str, QToolButton] = {}
+        _categories = [
+            ("all", "全部"),
+            ("text", "文本"),
+            ("image", "图片"),
+            ("files", "文件"),
+            ("link", "链接"),
+            ("html", "HTML"),
+            ("rtf", "RTF"),
+        ]
+        for cat_key, cat_label in _categories:
+            btn = QToolButton(card)
+            btn.setText(cat_label)
+            btn.setObjectName("btnCategoryChip")
+            btn.setCheckable(True)
+            btn.setChecked(cat_key == "all")
+            btn.setFixedHeight(26)
+            btn.setMinimumWidth(40)
+            btn.clicked.connect(lambda checked, k=cat_key: self._set_category(k))
+            self._category_buttons[cat_key] = btn
+            self._category_row.addWidget(btn)
+        self._category_row.addStretch(1)
 
         self._tabs = QTabWidget(card)
         self._tabs.setObjectName("tabs")
@@ -651,11 +1048,20 @@ class ClipPanel(QWidget):
         self._btn_settings.clicked.connect(lambda: self._on_open_settings() if self._on_open_settings else None)
         toolbar.addWidget(self._btn_settings)
 
+        self._btn_help = QToolButton(card)
+        self._btn_help.setObjectName("btnHelp")
+        self._btn_help.setText("?")
+        self._btn_help.setToolTip("使用指南")
+        self._btn_help.setFixedSize(32, 32)
+        self._btn_help.clicked.connect(self._show_help)
+        toolbar.addWidget(self._btn_help)
+
         body = QVBoxLayout(card)
         body.setContentsMargins(14, 12, 14, 14)
         body.setSpacing(8)
         body.addLayout(title_bar)
         body.addWidget(self._search)
+        body.addLayout(self._category_row)
         body.addLayout(toolbar)
         body.addWidget(self._tabs, 1)
         body.addLayout(pager)
@@ -665,9 +1071,11 @@ class ClipPanel(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.addWidget(card)
 
-        self.setMinimumSize(460, 420)
-        self.resize(640, 620)
-        self._grip = QSizeGrip(card)
+        self.setMinimumSize(400, 350)
+        # QSizeGrip must be child of the top-level widget (self), not card,
+        # so its coordinate space matches self.width()/height() used in resizeEvent.
+        self._grip = QSizeGrip(self)
+        self._grip.raise_()
         self._apply_styles()
         self._sync_status()
         self._set_preview_mode(True)
@@ -736,17 +1144,26 @@ class ClipPanel(QWidget):
         self._render_preview_image()
         try:
             grip_size = self._grip.sizeHint()
+            # root layout has 10px margins for drop shadow; align grip with card corner
             self._grip.move(
-                self.width() - grip_size.width() - 8,
-                self.height() - grip_size.height() - 8,
+                self.width() - grip_size.width() - 10,
+                self.height() - grip_size.height() - 10,
             )
+            self._grip.raise_()
         except Exception:
             pass
         self._render_popup_image()
 
     def mousePressEvent(self, event):  # type: ignore[override]
         if event.button() == Qt.LeftButton:
-            if event.position().y() <= 48:
+            pos = event.position()
+            # Don't intercept clicks in the grip area (bottom-right 24x24 px)
+            grip_size = self._grip.sizeHint()
+            in_grip = (
+                pos.x() >= self.width() - grip_size.width() - 10
+                and pos.y() >= self.height() - grip_size.height() - 10
+            )
+            if not in_grip and pos.y() <= 58:
                 self._drag_pos = QPoint(int(event.globalPosition().x()), int(event.globalPosition().y()))
                 event.accept()
                 return
@@ -880,6 +1297,10 @@ class ClipPanel(QWidget):
 
     def _refresh_lists(self) -> None:
         fav_ids = {fid for fid, _ in self._favorites}
+
+        # Batch update with signals/painting suppressed for performance
+        self._list_all.setUpdatesEnabled(False)
+        self._list_all.blockSignals(True)
         self._list_all.clear()
         all_page = self._clamp_page_index(len(self._filtered_items), False)
         all_start = all_page * self._PAGE_SIZE
@@ -890,9 +1311,12 @@ class ClipPanel(QWidget):
             item.setData(ROLE_IS_FAVORITE, self._fav_id_for_item(it, fav_ids) is not None)
             item.setData(ROLE_TITLE, _clean_preview(it, 150))
             item.setData(ROLE_SUBTITLE, _secondary_text(it))
-            item.setToolTip(it.preview(10_000))
             self._list_all.addItem(item)
+        self._list_all.blockSignals(False)
+        self._list_all.setUpdatesEnabled(True)
 
+        self._list_fav.setUpdatesEnabled(False)
+        self._list_fav.blockSignals(True)
         self._list_fav.clear()
         fav_page = self._clamp_page_index(len(self._fav_filtered), True)
         fav_start = fav_page * self._PAGE_SIZE
@@ -904,8 +1328,9 @@ class ClipPanel(QWidget):
             item.setData(ROLE_IS_FAVORITE, True)
             item.setData(ROLE_TITLE, _clean_preview(it, 150))
             item.setData(ROLE_SUBTITLE, _secondary_text(it))
-            item.setToolTip(it.preview(10_000))
             self._list_fav.addItem(item)
+        self._list_fav.blockSignals(False)
+        self._list_fav.setUpdatesEnabled(True)
 
         current = self._current_list()
         if current.count() > 0:
@@ -929,8 +1354,24 @@ class ClipPanel(QWidget):
         widget, item = target
         self._on_item_hover(widget, item)
 
+    def _set_category(self, category: str) -> None:
+        self._active_category = category
+        for key, btn in self._category_buttons.items():
+            btn.setChecked(key == category)
+        self._all_page = 0
+        self._fav_page = 0
+        self._apply_filter()
+
+    @staticmethod
+    def _item_display_type(it: ClipboardItem) -> str:
+        """Return the display category for an item (detects links in text)."""
+        if it.item_type == "text" and it.text and _RE_URL.search(it.text):
+            return "link"
+        return it.item_type
+
     def _apply_filter(self) -> None:
         q = (self._search.text() or "").strip().lower()
+        cat = self._active_category
         preview_lc_cache: dict[int, str] = {}
 
         def _preview_lc(it: ClipboardItem) -> str:
@@ -943,11 +1384,15 @@ class ClipPanel(QWidget):
             return val
 
         def _matches_query(it: ClipboardItem) -> bool:
-            if q in _preview_lc(it):
-                return True
-            return it.item_type == "files" and any(q in p.lower() for p in (it.file_paths or ()))
+            if q and q not in _preview_lc(it):
+                if not (it.item_type == "files" and any(q in p.lower() for p in (it.file_paths or ()))):
+                    return False
+            if cat != "all":
+                if self._item_display_type(it) != cat:
+                    return False
+            return True
 
-        if not q:
+        if not q and cat == "all":
             self._filtered_items = self._all_items[:]
             self._fav_filtered = self._favorites[:]
         else:
@@ -1332,6 +1777,10 @@ class ClipPanel(QWidget):
         self._status.style().unpolish(self._status)
         self._status.style().polish(self._status)
 
+    def _show_help(self) -> None:
+        dlg = HelpDialog(self)
+        dlg.exec()
+
     def _sync_tooltips(self) -> None:
         has_actions = bool(self._on_clear) or bool(self._on_open_settings)
         self._btn_clear.setVisible(bool(self._on_clear))
@@ -1386,6 +1835,26 @@ class ClipPanel(QWidget):
             QLineEdit:focus {
               border: 1px solid #3B82F6;
               background: #F8FAFC;
+            }
+            QToolButton#btnCategoryChip {
+              padding: 3px 10px;
+              border-radius: 13px;
+              border: 1px solid rgba(148, 163, 184, 0.5);
+              background: #FFFFFF;
+              color: #475569;
+              font-size: 12px;
+              font-weight: 500;
+            }
+            QToolButton#btnCategoryChip:hover {
+              background: #F1F5F9;
+              border: 1px solid rgba(148, 163, 184, 0.7);
+              color: #1E293B;
+            }
+            QToolButton#btnCategoryChip:checked {
+              background: #2563EB;
+              border: 1px solid #1D4ED8;
+              color: #FFFFFF;
+              font-weight: 600;
             }
             QListWidget {
               border: 1px solid rgba(148, 163, 184, 0.5);
@@ -1489,6 +1958,24 @@ class ClipPanel(QWidget):
             QToolButton#btnWinClose:hover {
               background: rgba(239, 68, 68, 0.18);
               color: #DC2626;
+            }
+            QToolButton#btnHelp {
+              font-size: 14px;
+              font-weight: 800;
+              padding: 0px;
+              border-radius: 16px;
+              border: 1.5px solid rgba(37, 99, 235, 0.35);
+              background: rgba(219, 234, 254, 0.55);
+              color: #2563EB;
+            }
+            QToolButton#btnHelp:hover {
+              background: rgba(37, 99, 235, 0.15);
+              border: 1.5px solid #2563EB;
+              color: #1D4ED8;
+            }
+            QToolButton#btnHelp:pressed {
+              background: #2563EB;
+              color: #FFFFFF;
             }
             QScrollBar:vertical {
               border: none;

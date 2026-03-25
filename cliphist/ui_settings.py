@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 from .settings import AppSettings, MAX_ITEMS_LIMIT
 
 
-ApplySettings = Callable[[str, str, int, bool], tuple[bool, str | None]]
+ApplySettings = Callable[[str, str, int, bool, int, int], tuple[bool, str | None]]
 
 
 class SettingsDialog(QDialog):
@@ -67,20 +67,32 @@ class SettingsDialog(QDialog):
         self._hotkey_pause = QKeySequenceEdit(card)
         self._max_items = QSpinBox(card)
         self._autostart = QCheckBox("开机自动启动 ClipHist", card)
+        self._panel_width = QSpinBox(card)
+        self._panel_height = QSpinBox(card)
         self._hotkey_show.setKeySequence(QKeySequence(settings.hotkey_show_panel))
         self._hotkey_pause.setKeySequence(QKeySequence(settings.hotkey_toggle_pause))
         self._max_items.setRange(50, MAX_ITEMS_LIMIT)
         self._max_items.setSingleStep(50)
         self._max_items.setValue(settings.max_items)
         self._autostart.setChecked(settings.autostart_enabled)
+        self._panel_width.setRange(400, 1600)
+        self._panel_width.setSingleStep(20)
+        self._panel_width.setValue(settings.panel_width)
+        self._panel_width.setSuffix(" px")
+        self._panel_height.setRange(350, 1200)
+        self._panel_height.setSingleStep(20)
+        self._panel_height.setValue(settings.panel_height)
+        self._panel_height.setSuffix(" px")
 
         form = QFormLayout()
         form.addRow("打开面板：", self._hotkey_show)
         form.addRow("暂停监听：", self._hotkey_pause)
         form.addRow("历史条数：", self._max_items)
         form.addRow("开机自启：", self._autostart)
+        form.addRow("窗口宽度：", self._panel_width)
+        form.addRow("窗口高度：", self._panel_height)
 
-        hint = QLabel("仅支持 Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24/方向键等常见组合键。历史条数决定当前会加载多少条历史记录；开机自启会在 Windows 启动目录创建或移除快捷方式。", card)
+        hint = QLabel("仅支持 Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24/方向键等常见组合键。历史条数决定当前会加载多少条历史记录；开机自启会在 Windows 启动目录创建或移除快捷方式；窗口宽高设置重启后生效。", card)
         hint.setWordWrap(True)
         hint.setObjectName("settingsHint")
 
@@ -116,7 +128,7 @@ class SettingsDialog(QDialog):
         root.addWidget(card)
         self.setLayout(root)
 
-        self.resize(460, 300)
+        self.resize(460, 360)
         self._apply_styles()
 
     def _apply_styles(self) -> None:
@@ -234,6 +246,8 @@ class SettingsDialog(QDialog):
         self._hotkey_pause.setKeySequence(QKeySequence("Alt+P"))
         self._max_items.setValue(5000)
         self._autostart.setChecked(False)
+        self._panel_width.setValue(640)
+        self._panel_height.setValue(620)
 
     def _on_ok(self) -> None:
         show_seq = self._hotkey_show.keySequence().toString(QKeySequence.PortableText).strip()
@@ -243,7 +257,10 @@ class SettingsDialog(QDialog):
         if pause_seq == "None":
             pause_seq = ""
 
-        ok, msg = self._apply_settings(show_seq, pause_seq, int(self._max_items.value()), self._autostart.isChecked())
+        ok, msg = self._apply_settings(
+            show_seq, pause_seq, int(self._max_items.value()), self._autostart.isChecked(),
+            int(self._panel_width.value()), int(self._panel_height.value()),
+        )
         if not ok:
             QMessageBox.warning(self, "设置", msg or "保存失败")
             return

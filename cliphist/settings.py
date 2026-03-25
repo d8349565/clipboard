@@ -21,6 +21,8 @@ class AppSettings:
     db_path: str | None = None
     hotkey_show_panel: str = "Alt+C"
     hotkey_toggle_pause: str = "Alt+P"
+    panel_width: int = 640
+    panel_height: int = 620
 
 
 def default_app_dir() -> str:
@@ -53,6 +55,10 @@ def load_settings() -> AppSettings:
     db_path = data.get("db_path") or None
     hotkey_show_panel = str(data.get("hotkey_show_panel") or "Alt+C")
     hotkey_toggle_pause = str(data.get("hotkey_toggle_pause") or "Alt+P")
+    panel_width = int(data.get("panel_width", 640))
+    panel_height = int(data.get("panel_height", 620))
+    panel_width = max(400, min(panel_width, 1600))
+    panel_height = max(350, min(panel_height, 1200))
     return AppSettings(
         max_items=max_items,
         persist_enabled=persist_enabled,
@@ -60,6 +66,8 @@ def load_settings() -> AppSettings:
         db_path=db_path,
         hotkey_show_panel=hotkey_show_panel,
         hotkey_toggle_pause=hotkey_toggle_pause,
+        panel_width=panel_width,
+        panel_height=panel_height,
     )
 
 

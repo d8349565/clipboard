@@ -79,6 +79,7 @@ class ClipHistApp:
             reorder_favorites=self._reorder_favorites,
             edit_item=self._edit_item,
         )
+        self.panel.resize(self.settings.panel_width, self.settings.panel_height)
         try:
             self.panel.setWindowIcon(self._app_icon)
         except Exception:
@@ -403,8 +404,10 @@ class ClipHistApp:
         self._sync_ui_state()
         return True, warn
 
-    def _apply_settings(self, show_seq: str, pause_seq: str, max_items: int, autostart_enabled: bool) -> tuple[bool, str | None]:
+    def _apply_settings(self, show_seq: str, pause_seq: str, max_items: int, autostart_enabled: bool, panel_width: int = 640, panel_height: int = 620) -> tuple[bool, str | None]:
         max_items = max(1, int(max_items))
+        panel_width = max(400, min(int(panel_width), 1600))
+        panel_height = max(350, min(int(panel_height), 1200))
 
         ok, warn = self._apply_hotkeys(show_seq, pause_seq, save=False)
         if not ok:
@@ -434,12 +437,16 @@ class ClipHistApp:
             autostart_enabled=autostart_enabled,
             hotkey_show_panel=(show_seq or "").strip(),
             hotkey_toggle_pause=(pause_seq or "").strip(),
+            panel_width=panel_width,
+            panel_height=panel_height,
         )
         try:
             save_settings(self.settings)
         except Exception:
             log.exception("保存设置失败")
             return False, "设置已应用，但保存到配置文件失败"
+
+        self.panel.resize(panel_width, panel_height)
 
         if self.panel.isVisible():
             self.panel.set_items(self.history.items())
