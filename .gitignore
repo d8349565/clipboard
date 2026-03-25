@@ -18,7 +18,7 @@ tests
 .vscode/
 .trae/
 .tools
-
+.claude
 *.log
 *.tmp
 Thumbs.db
@@ -30,3 +30,4 @@ dist/
 
 *.sqlite3
 *.db
+.claude/settings.local.json
