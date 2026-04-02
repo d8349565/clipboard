@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 from typing import Final
@@ -18,7 +18,8 @@ from .text_util import (
 
 HTML_FORMAT_NAME: Final[str] = "HTML Format"
 RTF_FORMAT_NAME: Final[str] = "Rich Text Format"
-MAX_IMAGE_BYTES: Final[int] = 50 * 1024 * 1024  # 50 MB
+MAX_IMAGE_BYTES: Final[int] = 8 * 1024 * 1024  # 8 MB
+MAX_RICH_RAW_BYTES: Final[int] = 2 * 1024 * 1024  # 2 MB
 
 _cached_html_fmt: int | None = None
 _cached_rtf_fmt: int | None = None
@@ -53,7 +54,7 @@ def _to_bytes(v: object) -> bytes | None:
         return None
 
 
-def _capture_image_bytes() -> bytes | None:
+def _capture_image_bytes(max_bytes: int = MAX_IMAGE_BYTES) -> bytes | None:
     dibv5_fmt = getattr(win32con, "CF_DIBV5", 17)
     for fmt in (dibv5_fmt, win32con.CF_DIB):
         if not win32clipboard.IsClipboardFormatAvailable(fmt):
@@ -61,8 +62,8 @@ def _capture_image_bytes() -> bytes | None:
         dib = _to_bytes(win32clipboard.GetClipboardData(fmt))
         if not dib:
             continue
-        if len(dib) > MAX_IMAGE_BYTES:
-            log.warning("图片超出大小限制 (%d bytes)，已跳过", len(dib))
+        if len(dib) > max_bytes:
+            log.warning("Image payload exceeds limit (%d bytes), skipped", len(dib))
             continue
         return dib
     return None
@@ -78,20 +79,21 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
                 file_paths=file_paths,
             )
 
-        image_bytes = _capture_image_bytes()
-
         html_fmt = _get_html_fmt()
         if win32clipboard.IsClipboardFormatAvailable(html_fmt):
             raw_b = _to_bytes(win32clipboard.GetClipboardData(html_fmt))
             if not raw_b:
                 raw_b = b""
             preview = _extract_html_fragment_preview(raw_b)
+            keep_raw = raw_b
+            if len(raw_b) > MAX_RICH_RAW_BYTES:
+                log.warning("HTML payload exceeds limit (%d bytes), keep preview only", len(raw_b))
+                keep_raw = None
             return ClipboardItem(
                 created_at=ClipboardItem.now_utc(),
                 item_type="html",
                 text=preview,
-                raw_bytes=raw_b,
-                image_bytes=image_bytes,
+                raw_bytes=keep_raw,
             )
 
         rtf_fmt = _get_rtf_fmt()
@@ -100,12 +102,15 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
             if not raw_b:
                 raw_b = b""
             preview = _rtf_preview(raw_b)
+            keep_raw = raw_b
+            if len(raw_b) > MAX_RICH_RAW_BYTES:
+                log.warning("RTF payload exceeds limit (%d bytes), keep preview only", len(raw_b))
+                keep_raw = None
             return ClipboardItem(
                 created_at=ClipboardItem.now_utc(),
                 item_type="rtf",
                 text=preview,
-                raw_bytes=raw_b,
-                image_bytes=image_bytes,
+                raw_bytes=keep_raw,
             )
 
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
@@ -116,9 +121,9 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
                 created_at=ClipboardItem.now_utc(),
                 item_type="text",
                 text=str(text),
-                image_bytes=image_bytes,
             )
 
+        image_bytes = _capture_image_bytes(MAX_IMAGE_BYTES)
         if image_bytes:
             return ClipboardItem(
                 created_at=ClipboardItem.now_utc(),
