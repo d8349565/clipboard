@@ -14,7 +14,7 @@ from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 
 from .autostart import is_autostart_enabled, set_autostart_enabled
-from .favorites import FavoritesStore
+from .favorites import FavoritesStore, item_fingerprint
 from .hotkeys import HotkeySpec, parse_hotkey_sequence
 from .models import ClipboardItem
 from .persistence import SQLiteHistoryStore
@@ -78,6 +78,7 @@ class ClipHistApp:
             remove_favorite=self._remove_favorite,
             reorder_favorites=self._reorder_favorites,
             edit_item=self._edit_item,
+            load_blobs=self._load_blobs_for_ui,
         )
         self.panel.resize(self.settings.panel_width, self.settings.panel_height)
         try:
@@ -171,17 +172,41 @@ class ClipHistApp:
             if self.paused:
                 return
             added = self.history.add(evt)
-            if added and self.panel.isVisible():
-                self.panel.set_items(self.history.items())
-                self.panel.set_favorites(self._get_favorites())
-            if added and self._store is not None:
+            if not added:
+                return
+            # Persist first, then slim the in-memory copy
+            if self._store is not None:
                 try:
-                    self._store.insert(evt)
+                    fp = item_fingerprint(evt)
+                    row_id = self._store.insert(evt)
+                    slim = evt.with_db_id(row_id).slim(fingerprint=fp)
+                    self.history.replace_first(evt, slim)
                 except Exception:
                     log.exception("持久化写入失败")
+            if self.panel.isVisible():
+                self.panel.set_items(self.history.items())
+                self.panel.set_favorites(self._get_favorites())
 
     def _activate_item(self, item: ClipboardItem) -> None:
+        item = self._ensure_blobs(item)
         set_clipboard_item(item, hwnd=self.listener.hwnd)
+
+    def _ensure_blobs(self, item: ClipboardItem) -> ClipboardItem:
+        """Load blob data from DB if the item is slim and has a db_id."""
+        if not item.needs_blob_load:
+            return item
+        if self._store is None or item.db_id is None:
+            return item
+        try:
+            raw, img = self._store.load_blobs(item.db_id)
+            return item.with_blobs(raw, img)
+        except Exception:
+            log.exception("按需加载 blob 失败 (db_id=%s)", item.db_id)
+            return item
+
+    def _load_blobs_for_ui(self, item: ClipboardItem) -> ClipboardItem:
+        """Public blob loader exposed to UI panel for preview/drag."""
+        return self._ensure_blobs(item)
 
     def _set_paused(self, paused: bool) -> None:
         if self.paused == paused:
@@ -204,6 +229,8 @@ class ClipHistApp:
         return [(e.fav_id, e.item) for e in self.favorites.entries]
 
     def _toggle_favorite(self, item: ClipboardItem) -> tuple[bool, str | None]:
+        # Load blobs so that favorites are stored with full data
+        item = self._ensure_blobs(item)
         is_now_fav, _ = self.favorites.toggle(item)
         try:
             self.favorites.save()
@@ -245,9 +272,9 @@ class ClipHistApp:
             except Exception:
                 log.exception("保存编辑后的收藏失败")
 
-        if self._store is not None:
+        if self._store is not None and old_item.db_id is not None:
             try:
-                self._store.replace_all(self.history.items())
+                self._store.update_text(old_item.db_id, new_item.text)
             except Exception:
                 log.exception("同步编辑后的持久化历史失败")
                 return False, "已更新内存历史，但持久化同步失败"
@@ -263,7 +290,7 @@ class ClipHistApp:
             try:
                 os.makedirs(os.path.dirname(db_path), exist_ok=True)
                 self._store = SQLiteHistoryStore(db_path)
-                loaded = self._store.load_recent(self.history.max_items)
+                loaded = self._store.load_recent_slim(self.history.max_items)
                 for it in reversed(loaded):
                     self.history.add(it)
             except Exception:
@@ -425,7 +452,7 @@ class ClipHistApp:
             self.history.set_max_items(max_items)
             if self._store is not None:
                 try:
-                    loaded = self._store.load_recent(max_items)
+                    loaded = self._store.load_recent_slim(max_items)
                     self.history.reset(loaded)
                 except Exception:
                     log.exception("更新历史条数后重新加载持久化历史失败")
