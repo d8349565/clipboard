@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace as _dc_replace
 from datetime import datetime, timezone
 from typing import Literal, Sequence
 
 
 ClipboardItemType = Literal["text", "files", "image", "html", "rtf", "unknown"]
+
+
+def _bytes_hash(b: bytes) -> str:
+    """Return a short hex digest for deduplication without keeping full bytes in memory."""
+    return hashlib.sha1(b).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,23 +22,66 @@ class ClipboardItem:
     file_paths: tuple[str, ...] | None = None
     raw_bytes: bytes | None = None
     image_bytes: bytes | None = None
+    db_id: int | None = None
+    raw_size: int = 0
+    image_size: int = 0
+    _raw_hash: str | None = None
+    _image_hash: str | None = None
+    _fingerprint: str | None = None
 
     @staticmethod
     def now_utc() -> datetime:
         return datetime.now(timezone.utc)
 
+    def slim(self, fingerprint: str | None = None) -> ClipboardItem:
+        """Return a copy without heavy blob fields, preserving metadata for display."""
+        if self.raw_bytes is None and self.image_bytes is None:
+            if fingerprint and not self._fingerprint:
+                return _dc_replace(self, _fingerprint=fingerprint)
+            return self
+        return _dc_replace(
+            self,
+            raw_bytes=None,
+            image_bytes=None,
+            raw_size=self.raw_size or len(self.raw_bytes or b""),
+            image_size=self.image_size or len(self.image_bytes or b""),
+            _raw_hash=self._raw_hash or (_bytes_hash(self.raw_bytes) if self.raw_bytes else None),
+            _image_hash=self._image_hash or (_bytes_hash(self.image_bytes) if self.image_bytes else None),
+            _fingerprint=fingerprint or self._fingerprint,
+        )
+
+    def with_db_id(self, db_id: int) -> ClipboardItem:
+        return _dc_replace(self, db_id=db_id)
+
+    def with_blobs(self, raw_bytes: bytes | None, image_bytes: bytes | None) -> ClipboardItem:
+        """Return a copy with blob fields restored (from DB on-demand load)."""
+        return _dc_replace(self, raw_bytes=raw_bytes, image_bytes=image_bytes)
+
+    @property
+    def needs_blob_load(self) -> bool:
+        """True if this item has blobs in DB but they are not loaded in memory."""
+        if self.raw_bytes is not None or self.image_bytes is not None:
+            return False
+        return (self.raw_size > 0 or self.image_size > 0) and self.db_id is not None
+
     def dedupe_key(self) -> tuple:
         if self.item_type == "text":
-            return ("text", self.text or "", self.image_bytes or b"")
+            ih = self._image_hash or (_bytes_hash(self.image_bytes) if self.image_bytes else "")
+            return ("text", self.text or "", ih)
         if self.item_type == "files":
             return ("files", self.file_paths or ())
         if self.item_type == "image":
-            return ("image", self.raw_bytes or b"")
+            h = self._raw_hash or (_bytes_hash(self.raw_bytes) if self.raw_bytes else "")
+            return ("image", h)
         if self.item_type in ("html", "rtf"):
-            if self.raw_bytes is not None:
-                return (self.item_type, self.raw_bytes, self.image_bytes or b"")
-            return (self.item_type, self.text or "", self.image_bytes or b"")
-        return ("unknown", self.text or "", self.file_paths or (), self.raw_bytes or b"", self.image_bytes or b"")
+            rh = self._raw_hash or (_bytes_hash(self.raw_bytes) if self.raw_bytes else "")
+            ih = self._image_hash or (_bytes_hash(self.image_bytes) if self.image_bytes else "")
+            if rh:
+                return (self.item_type, rh, ih)
+            return (self.item_type, self.text or "", ih)
+        return ("unknown", self.text or "", self.file_paths or (),
+                self._raw_hash or (_bytes_hash(self.raw_bytes) if self.raw_bytes else ""),
+                self._image_hash or (_bytes_hash(self.image_bytes) if self.image_bytes else ""))
 
     def preview(self, max_len: int = 120) -> str:
         if self.item_type == "text":
@@ -46,7 +95,7 @@ class ClipboardItem:
                 return paths[0]
             return f"{paths[0]} +{len(paths)-1}"
         if self.item_type == "image":
-            size = len(self.raw_bytes or b"")
+            size = self.raw_size or len(self.raw_bytes or b"")
             return f"(图片 {size} bytes)"
         if self.item_type in ("html", "rtf"):
             s = (self.text or "").replace("\r\n", "\n").replace("\r", "\n")
