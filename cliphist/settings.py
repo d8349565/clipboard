@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -15,7 +15,7 @@ MAX_ITEMS_LIMIT: int = 10000
 
 @dataclass(frozen=True, slots=True)
 class AppSettings:
-    max_items: int = 5000
+    max_items: int = 1000
     persist_enabled: bool = False
     autostart_enabled: bool = False
     db_path: str | None = None
@@ -46,9 +46,9 @@ def load_settings() -> AppSettings:
     except Exception:
         data = {}
 
-    max_items = int(data.get("max_items", 5000))
+    max_items = int(data.get("max_items", 1000))
     if max_items <= 0:
-        max_items = 5000
+        max_items = 1000
     max_items = min(max_items, MAX_ITEMS_LIMIT)
     persist_enabled = bool(data.get("persist_enabled", False))
     autostart_enabled = bool(data.get("autostart_enabled", is_autostart_enabled()))
