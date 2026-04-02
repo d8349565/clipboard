@@ -15,6 +15,9 @@ from .settings import default_app_dir
 
 
 def item_fingerprint(item: ClipboardItem) -> str:
+    # Use cached fingerprint when available (computed before slimming)
+    if item._fingerprint:
+        return item._fingerprint
     h = hashlib.sha1()
     t = item.item_type.encode("utf-8")
     h.update(t)
