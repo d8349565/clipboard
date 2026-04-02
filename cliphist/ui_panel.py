@@ -394,9 +394,11 @@ class HelpDialog(QDialog):
 
 
 class _ClipListWidget(QListWidget):
-    def __init__(self, get_item: Callable[[int], ClipboardItem | None], parent: QWidget | None = None) -> None:
+    def __init__(self, get_item: Callable[[int], ClipboardItem | None], parent: QWidget | None = None,
+                 load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None) -> None:
         super().__init__(parent)
         self._get_item = get_item
+        self._load_blobs = load_blobs
         self.setDragEnabled(True)
 
     def startDrag(self, supportedActions):  # type: ignore[override]
@@ -404,6 +406,10 @@ class _ClipListWidget(QListWidget):
         it = self._get_item(row)
         if it is None:
             return
+
+        # Load blobs on-demand for image drag
+        if it.needs_blob_load and self._load_blobs is not None:
+            it = self._load_blobs(it)
 
         mime = QMimeData()
         if it.item_type in ("text", "html", "rtf"):
@@ -497,11 +503,11 @@ def _secondary_text(item: ClipboardItem) -> str:
         n = len(item.file_paths or ())
         return f"{ts} · {n} 个文件"
     if item.item_type == "image":
-        size = len(item.raw_bytes or b"")
+        size = item.raw_size or len(item.raw_bytes or b"")
         kb = max(1, size // 1024)
         return f"{ts} · {kb} KB"
     if item.item_type in ("html", "rtf"):
-        size = len(item.raw_bytes or b"")
+        size = item.raw_size or len(item.raw_bytes or b"")
         if size:
             kb = max(1, size // 1024)
             return f"{ts} · {kb} KB"
@@ -730,6 +736,7 @@ class ClipPanel(QWidget):
         remove_favorite: Callable[[str], tuple[bool, str | None]] | None = None,
         reorder_favorites: Callable[[list[str]], tuple[bool, str | None]] | None = None,
         edit_item: Callable[[ClipboardItem, ClipboardItem], tuple[bool, str | None]] | None = None,
+        load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None,
     ) -> None:
         super().__init__()
         self._on_activate = on_activate
@@ -740,6 +747,7 @@ class ClipPanel(QWidget):
         self._remove_favorite = remove_favorite
         self._reorder_favorites = reorder_favorites
         self._edit_item = edit_item
+        self._load_blobs = load_blobs
         self._all_items: list[ClipboardItem] = []
         self._filtered_items: list[ClipboardItem] = []
         self._favorites: list[tuple[str, ClipboardItem]] = []
@@ -802,7 +810,7 @@ class ClipPanel(QWidget):
         self._tabs = QTabWidget(card)
         self._tabs.setObjectName("tabs")
 
-        self._list_all = _ClipListWidget(self._get_filtered_item, card)
+        self._list_all = _ClipListWidget(self._get_filtered_item, card, load_blobs=self._load_blobs)
         self._list_all.setUniformItemSizes(True)
         self._delegate_all = _ClipItemDelegate(self._list_all)
         self._list_all.setItemDelegate(self._delegate_all)
@@ -817,7 +825,7 @@ class ClipPanel(QWidget):
         self._list_all.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self._list_all, pos))
         self._list_all.viewport().installEventFilter(self)
 
-        self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card)
+        self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card, load_blobs=self._load_blobs)
         self._list_fav.setUniformItemSizes(True)
         self._delegate_fav = _ClipItemDelegate(self._list_fav)
         self._list_fav.setItemDelegate(self._delegate_fav)
@@ -1094,6 +1102,12 @@ class ClipPanel(QWidget):
         self._favorites = favorites
         self._delegate_fav.clear_caches()
         self._apply_filter()
+
+    def _ensure_blobs(self, it: ClipboardItem) -> ClipboardItem:
+        """Load blob data on-demand from the DB via the callback."""
+        if not it.needs_blob_load or self._load_blobs is None:
+            return it
+        return self._load_blobs(it)
 
     def toggle_visible(self) -> None:
         if self.isVisible():
@@ -1456,6 +1470,10 @@ class ClipPanel(QWidget):
         ts = it.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         meta_label.setText(f"{it.item_type.upper()} · {ts}")
 
+        # Load blobs on-demand for types that need them
+        if it.item_type in ("image", "html", "rtf") and it.needs_blob_load:
+            it = self._ensure_blobs(it)
+
         if it.item_type == "image":
             img = _qimage_from_dib(it.raw_bytes or b"")
             if img is None or img.isNull():
@@ -1531,8 +1549,12 @@ class ClipPanel(QWidget):
             self._popup_stack,
             docked=False,
         )
-        popup_w = min(520, max(360, self.width() - 40))
-        popup_h = 220 if it.item_type != "image" else 280
+        if it.item_type == "image":
+            popup_w = min(640, max(420, self.width()))
+            popup_h = 420
+        else:
+            popup_w = min(520, max(360, self.width() - 40))
+            popup_h = 220
         self._preview_popup.resize(popup_w, popup_h)
         screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
         screen_geo = screen.availableGeometry()
