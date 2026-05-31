@@ -7,11 +7,13 @@ from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QKeySequenceEdit,
@@ -21,10 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .settings import AppSettings, MAX_ITEMS_LIMIT
+from .settings import AppSettings, MAX_ITEMS_LIMIT, default_db_path
 
 
-ApplySettings = Callable[[str, str, int, bool, int, int], tuple[bool, str | None]]
+ApplySettings = Callable[[str, str, int, bool, int, int, str], tuple[bool, str | None]]
 
 
 class SettingsDialog(QDialog):
@@ -34,7 +36,7 @@ class SettingsDialog(QDialog):
         self._apply_settings = apply_settings
         self._drag_pos: QPoint | None = None
 
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("设置")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setModal(True)
@@ -49,7 +51,7 @@ class SettingsDialog(QDialog):
 
         # -- title bar --
         title_bar = QHBoxLayout()
-        title_label = QLabel("Settings", card)
+        title_label = QLabel("设置", card)
         title_label.setObjectName("settingsTitle")
         title_bar.addWidget(title_label)
         title_bar.addStretch(1)
@@ -57,7 +59,7 @@ class SettingsDialog(QDialog):
         btn_close = QToolButton(card)
         btn_close.setObjectName("btnWinControl")
         btn_close.setText("x")
-        btn_close.setToolTip("Close")
+        btn_close.setToolTip("关闭")
         btn_close.setFixedSize(28, 28)
         btn_close.clicked.connect(self.reject)
         title_bar.addWidget(btn_close)
@@ -66,7 +68,7 @@ class SettingsDialog(QDialog):
         self._hotkey_show = QKeySequenceEdit(card)
         self._hotkey_pause = QKeySequenceEdit(card)
         self._max_items = QSpinBox(card)
-        self._autostart = QCheckBox("Start ClipHist with Windows", card)
+        self._autostart = QCheckBox("开机时随 Windows 启动 ClipHist", card)
         self._panel_width = QSpinBox(card)
         self._panel_height = QSpinBox(card)
         self._hotkey_show.setKeySequence(QKeySequence(settings.hotkey_show_panel))
@@ -84,32 +86,52 @@ class SettingsDialog(QDialog):
         self._panel_height.setValue(settings.panel_height)
         self._panel_height.setSuffix(" px")
 
+        # -- database path --
+        self._db_path = QLineEdit(card)
+        self._db_path.setPlaceholderText(default_db_path())
+        self._db_path.setText(settings.db_path or "")
+        self._db_path.setToolTip("留空则使用默认位置：" + default_db_path())
+        btn_browse = QToolButton(card)
+        btn_browse.setObjectName("settingsBtn")
+        btn_browse.setText("...")
+        btn_browse.setToolTip("选择数据库文件位置")
+        btn_browse.setFixedHeight(30)
+        btn_browse.clicked.connect(self._browse_db_path)
+        db_row = QHBoxLayout()
+        db_row.setContentsMargins(0, 0, 0, 0)
+        db_row.setSpacing(6)
+        db_row.addWidget(self._db_path, 1)
+        db_row.addWidget(btn_browse)
+        db_row_widget = QWidget(card)
+        db_row_widget.setLayout(db_row)
+
         form = QFormLayout()
-        form.addRow("Open panel hotkey:", self._hotkey_show)
-        form.addRow("Pause hotkey:", self._hotkey_pause)
-        form.addRow("History items:", self._max_items)
-        form.addRow("Autostart:", self._autostart)
-        form.addRow("Panel width:", self._panel_width)
-        form.addRow("Panel height:", self._panel_height)
+        form.addRow("打开面板热键：", self._hotkey_show)
+        form.addRow("暂停热键：", self._hotkey_pause)
+        form.addRow("历史条数：", self._max_items)
+        form.addRow("开机自启：", self._autostart)
+        form.addRow("面板宽度：", self._panel_width)
+        form.addRow("面板高度：", self._panel_height)
+        form.addRow("数据库文件：", db_row_widget)
 
         hint = QLabel(
-            "Hotkeys support Ctrl/Alt/Shift/Win with A-Z, 0-9, arrow keys, and F1-F24. "
-            "History count controls in-memory items.",
+            "热键支持 Ctrl/Alt/Shift/Win 与 A-Z、0-9、方向键、F1-F24 的组合。"
+            "历史条数控制内存中保留的记录数量。数据库文件留空则使用默认位置。",
             card,
         )
         hint.setWordWrap(True)
         hint.setObjectName("settingsHint")
 
         # -- buttons --
-        btn_reset = QPushButton("Reset", card)
+        btn_reset = QPushButton("恢复默认", card)
         btn_reset.setObjectName("settingsBtn")
         btn_reset.clicked.connect(self._reset_defaults)
 
-        btn_ok = QPushButton("OK", card)
+        btn_ok = QPushButton("确定", card)
         btn_ok.setObjectName("settingsBtnPrimary")
         btn_ok.clicked.connect(self._on_ok)
 
-        btn_cancel = QPushButton("Cancel", card)
+        btn_cancel = QPushButton("取消", card)
         btn_cancel.setObjectName("settingsBtn")
         btn_cancel.clicked.connect(self.reject)
 
@@ -244,6 +266,17 @@ class SettingsDialog(QDialog):
             self._drag_pos = None
         super().mouseReleaseEvent(event)
 
+    def _browse_db_path(self) -> None:
+        current = self._db_path.text().strip() or default_db_path()
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "选择数据库文件",
+            current,
+            "SQLite 数据库 (*.sqlite3 *.db);;所有文件 (*.*)",
+        )
+        if path:
+            self._db_path.setText(path)
+
     def _reset_defaults(self) -> None:
         self._hotkey_show.setKeySequence(QKeySequence("Alt+C"))
         self._hotkey_pause.setKeySequence(QKeySequence("Alt+P"))
@@ -251,6 +284,7 @@ class SettingsDialog(QDialog):
         self._autostart.setChecked(False)
         self._panel_width.setValue(640)
         self._panel_height.setValue(620)
+        self._db_path.clear()
 
     def _on_ok(self) -> None:
         show_seq = self._hotkey_show.keySequence().toString(QKeySequence.PortableText).strip()
@@ -267,8 +301,9 @@ class SettingsDialog(QDialog):
             self._autostart.isChecked(),
             int(self._panel_width.value()),
             int(self._panel_height.value()),
+            self._db_path.text().strip(),
         )
         if not ok:
-            QMessageBox.warning(self, "Settings", msg or "Save failed")
+            QMessageBox.warning(self, "设置", msg or "保存失败")
             return
         self.accept()

@@ -68,7 +68,7 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
             ("自动捕获", "复制任意内容（文字、图片、文件、HTML、RTF）后，ClipHist 自动保存至历史顶部。"),
             ("支持类型", "文本 · 链接 · 图片（位图）· 文件路径 · HTML 富文本 · RTF 富文本。"),
             ("自动去重", "连续复制相同内容只保留一条，不会重复叠加。"),
-            ("容量上限", "默认保存最近 5000 条，可在设置中调整（最多 10000 条）。"),
+            ("容量上限", "默认保存最近 1000 条，可在设置中调整（最多 10000 条）。"),
             ("暂停监听", "按 Alt+P 或托盘菜单「暂停」，暂停期间复制的内容不会被记录。"),
         ],
     ),
@@ -497,6 +497,20 @@ def _clean_preview(item: ClipboardItem, max_len: int = 120) -> str:
     return s if len(s) <= max_len else s[: max_len - 1] + "…"
 
 
+def _favorite_title(item: ClipboardItem, max_len: int = 150) -> str:
+    """收藏列表中文件项只显示文件名，不显示完整路径。"""
+    if item.item_type == "files":
+        paths = item.file_paths or ()
+        if paths:
+            import os as _os
+
+            name = _os.path.basename(paths[0].rstrip("\\/")) or paths[0]
+            if len(paths) > 1:
+                name = f"{name} +{len(paths) - 1}"
+            return name if len(name) <= max_len else name[: max_len - 1] + "…"
+    return _clean_preview(item, max_len)
+
+
 def _secondary_text(item: ClipboardItem) -> str:
     ts = item.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     if item.item_type == "files":
@@ -541,8 +555,9 @@ class _ClipItemDelegate(QStyledItemDelegate):
         "link": "链接",
     }
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None) -> None:
         super().__init__(parent)
+        self._load_blobs = load_blobs
         self._thumb_cache: dict[int, QPixmap] = {}
         self._preview_cache: dict[int, str] = {}
         self._secondary_cache: dict[int, str] = {}
@@ -619,7 +634,7 @@ class _ClipItemDelegate(QStyledItemDelegate):
             badge_h,
         )
         if it.item_type == "image":
-            thumb_size = 34
+            thumb_size = 42
             thumb_rect = QRect(
                 rect.left() + left_pad,
                 rect.top() + (rect.height() - thumb_size) // 2,
@@ -631,7 +646,12 @@ class _ClipItemDelegate(QStyledItemDelegate):
                 clip = QPainterPath()
                 clip.addRoundedRect(thumb_rect, 8, 8)
                 painter.setClipPath(clip)
-                painter.drawPixmap(thumb_rect, thumb)
+                # 按缩略图自身逻辑尺寸居中绘制，避免拉伸变形与二次放大模糊。
+                tw = thumb.width() / thumb.devicePixelRatio()
+                th = thumb.height() / thumb.devicePixelRatio()
+                tx = thumb_rect.left() + (thumb_rect.width() - tw) / 2
+                ty = thumb_rect.top() + (thumb_rect.height() - th) / 2
+                painter.drawPixmap(QPoint(int(round(tx)), int(round(ty))), thumb)
                 painter.setClipping(False)
                 painter.setPen(QColor(15, 23, 42, 40))
                 painter.drawRoundedRect(thumb_rect.adjusted(0, 0, -1, -1), 8, 8)
@@ -680,14 +700,38 @@ class _ClipItemDelegate(QStyledItemDelegate):
         return base.expandedTo(base.__class__(base.width(), 58))
 
     def _image_thumb(self, it: ClipboardItem, size: int) -> QPixmap | None:
-        key = self._cache_key(it)
+        # 按屏幕设备像素比渲染高清缩略图，避免在高 DPI 屏上被放大导致模糊。
+        dpr = 1.0
+        parent = self.parent()
+        if parent is not None:
+            try:
+                dpr = float(parent.devicePixelRatioF())
+            except Exception:
+                dpr = 1.0
+        if dpr < 1.0:
+            dpr = 1.0
+        key = hash((self._cache_key(it), size, round(dpr, 3)))
         cached = self._thumb_cache.get(key)
         if cached is not None:
             return cached
-        img = _qimage_from_dib(it.raw_bytes or b"")
+        raw = it.raw_bytes
+        # 列表中的图片项通常为 slim 模式（raw_bytes 为空），按需从数据库加载一次用于生成缩略图。
+        if not raw and it.needs_blob_load and self._load_blobs is not None:
+            try:
+                loaded = self._load_blobs(it)
+                raw = loaded.raw_bytes
+            except Exception:
+                raw = None
+        if not raw:
+            return None
+        img = _qimage_from_dib(raw)
         if img is None or img.isNull():
             return None
-        pix = QPixmap.fromImage(img).scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        target = max(1, int(round(size * dpr)))
+        pix = QPixmap.fromImage(img).scaled(
+            target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        pix.setDevicePixelRatio(dpr)
         self._thumb_cache[key] = pix
         if len(self._thumb_cache) > 260:
             self._thumb_cache.pop(next(iter(self._thumb_cache)))
@@ -812,7 +856,7 @@ class ClipPanel(QWidget):
 
         self._list_all = _ClipListWidget(self._get_filtered_item, card, load_blobs=self._load_blobs)
         self._list_all.setUniformItemSizes(True)
-        self._delegate_all = _ClipItemDelegate(self._list_all)
+        self._delegate_all = _ClipItemDelegate(self._list_all, load_blobs=self._load_blobs)
         self._list_all.setItemDelegate(self._delegate_all)
         self._list_all.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list_all.verticalScrollBar().setSingleStep(18)
@@ -827,7 +871,7 @@ class ClipPanel(QWidget):
 
         self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card, load_blobs=self._load_blobs)
         self._list_fav.setUniformItemSizes(True)
-        self._delegate_fav = _ClipItemDelegate(self._list_fav)
+        self._delegate_fav = _ClipItemDelegate(self._list_fav, load_blobs=self._load_blobs)
         self._list_fav.setItemDelegate(self._delegate_fav)
         self._list_fav.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list_fav.verticalScrollBar().setSingleStep(18)
@@ -1340,7 +1384,7 @@ class ClipPanel(QWidget):
             item.setData(ROLE_ITEM, it)
             item.setData(ROLE_FAV_ID, fid)
             item.setData(ROLE_IS_FAVORITE, True)
-            item.setData(ROLE_TITLE, _clean_preview(it, 150))
+            item.setData(ROLE_TITLE, _favorite_title(it, 150))
             item.setData(ROLE_SUBTITLE, _secondary_text(it))
             self._list_fav.addItem(item)
         self._list_fav.blockSignals(False)

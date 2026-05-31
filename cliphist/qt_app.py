@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 from dataclasses import replace
 
@@ -11,7 +12,7 @@ log = logging.getLogger(__name__)
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QIcon
-from PySide6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QStyle, QSystemTrayIcon
 
 from .autostart import is_autostart_enabled, set_autostart_enabled
 from .favorites import FavoritesStore, item_fingerprint
@@ -178,7 +179,7 @@ class ClipHistApp:
             if self._store is not None:
                 try:
                     fp = item_fingerprint(evt)
-                    row_id = self._store.insert(evt)
+                    row_id = self._store.insert_and_trim(evt, self.history.max_items)
                     slim = evt.with_db_id(row_id).slim(fingerprint=fp)
                     self.history.replace_first(evt, slim)
                 except Exception:
@@ -215,6 +216,8 @@ class ClipHistApp:
         self._sync_ui_state()
 
     def _clear_history(self) -> None:
+        if not self._confirm_clear():
+            return
         self.history.clear()
         if self._store is not None:
             try:
@@ -224,6 +227,17 @@ class ClipHistApp:
         if self.panel.isVisible():
             self.panel.set_items(self.history.items())
             self.panel.set_favorites(self._get_favorites())
+
+    def _confirm_clear(self) -> bool:
+        parent = self.panel if self.panel.isVisible() else None
+        reply = QMessageBox.question(
+            parent,
+            "清空历史",
+            "确定要清空全部历史记录吗？收藏的内容不受影响。此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
     def _get_favorites(self) -> list[tuple[str, ClipboardItem]]:
         return [(e.fav_id, e.item) for e in self.favorites.entries]
@@ -282,6 +296,41 @@ class ClipHistApp:
         if self.panel.isVisible():
             self.panel.set_items(self.history.items())
             self.panel.set_favorites(self._get_favorites())
+        return True, None
+
+    def _switch_db_path(self, new_db_path: str | None) -> tuple[bool, str | None]:
+        """关闭当前持久化存储，将历史库迁移到新位置并重新打开。"""
+        if self._store is None:
+            return True, None
+        current_path = self._store.path
+        target_path = new_db_path or default_db_path()
+        if os.path.abspath(current_path) == os.path.abspath(target_path):
+            return True, None
+        try:
+            self._store.close()
+        except Exception:
+            log.debug("切换数据库前关闭存储异常", exc_info=True)
+        self._store = None
+        try:
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            # 目标不存在时迁移现有数据库（含 WAL/SHM 辅助文件）。
+            if not os.path.exists(target_path) and os.path.exists(current_path):
+                for suffix in ("", "-wal", "-shm"):
+                    src = current_path + suffix
+                    dst = target_path + suffix
+                    if os.path.exists(src):
+                        shutil.move(src, dst)
+            self._store = SQLiteHistoryStore(target_path)
+            loaded = self._store.load_recent_slim(self.history.max_items)
+            self.history.reset(loaded)
+        except Exception:
+            log.exception("切换数据库位置失败")
+            # 尝试回退到原位置，避免丢失持久化能力。
+            try:
+                self._store = SQLiteHistoryStore(current_path)
+            except Exception:
+                self._store = None
+            return False, "数据库位置切换失败，请检查目标路径是否可写"
         return True, None
 
     def _enable_persistence(self, enabled: bool) -> None:
@@ -431,10 +480,11 @@ class ClipHistApp:
         self._sync_ui_state()
         return True, warn
 
-    def _apply_settings(self, show_seq: str, pause_seq: str, max_items: int, autostart_enabled: bool, panel_width: int = 640, panel_height: int = 620) -> tuple[bool, str | None]:
+    def _apply_settings(self, show_seq: str, pause_seq: str, max_items: int, autostart_enabled: bool, panel_width: int = 640, panel_height: int = 620, db_path: str = "") -> tuple[bool, str | None]:
         max_items = max(1, int(max_items))
         panel_width = max(400, min(int(panel_width), 1600))
         panel_height = max(350, min(int(panel_height), 1200))
+        new_db_path = (db_path or "").strip() or None
 
         ok, warn = self._apply_hotkeys(show_seq, pause_seq, save=False)
         if not ok:
@@ -446,6 +496,12 @@ class ClipHistApp:
             except Exception:
                 log.exception("更新开机自启设置失败")
                 return False, "热键已更新，但开机自启设置失败"
+
+        db_changed = new_db_path != self.settings.db_path
+        if db_changed and self._store is not None:
+            ok_db, err_db = self._switch_db_path(new_db_path)
+            if not ok_db:
+                return False, err_db
 
         previous_max_items = self.history.max_items
         if max_items != previous_max_items:
@@ -466,6 +522,7 @@ class ClipHistApp:
             hotkey_toggle_pause=(pause_seq or "").strip(),
             panel_width=panel_width,
             panel_height=panel_height,
+            db_path=new_db_path,
         )
         try:
             save_settings(self.settings)

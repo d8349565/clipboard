@@ -15,10 +15,15 @@ MAX_RICH_RAW_BYTES = 2 * 1024 * 1024
 
 class SQLiteHistoryStore:
     def __init__(self, db_path: str) -> None:
+        self._path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
+
+    @property
+    def path(self) -> str:
+        return self._path
 
     def _init_schema(self) -> None:
         self._conn.execute(
@@ -98,6 +103,14 @@ class SQLiteHistoryStore:
     def clear(self) -> None:
         self._conn.execute("DELETE FROM clipboard_items")
         self._conn.commit()
+        # DELETE 不会回收已分配的磁盘空间，VACUUM 重建数据库以缩小文件体积。
+        # WAL 模式下需先做一次检查点，确保 WAL 中的删除已合并进主库。
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            self._conn.execute("VACUUM;")
+            self._conn.commit()
+        except Exception:
+            log.warning("清空历史后 VACUUM 回收空间失败", exc_info=True)
 
     def replace_all(self, items: list[ClipboardItem]) -> None:
         self._conn.execute("BEGIN TRANSACTION")
