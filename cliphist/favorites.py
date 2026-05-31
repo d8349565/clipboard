@@ -14,6 +14,10 @@ from .models import ClipboardItem
 from .settings import default_app_dir
 
 
+# 收藏夹上限，超出后自动淘汰最旧的收藏，避免无限增长。
+MAX_FAVORITES: int = 500
+
+
 def item_fingerprint(item: ClipboardItem) -> str:
     # Use cached fingerprint when available (computed before slimming)
     if item._fingerprint:
@@ -50,27 +54,39 @@ def item_fingerprint(item: ClipboardItem) -> str:
     return h.hexdigest()
 
 
-def _encode_item(it: ClipboardItem) -> dict:
+def _encode_item(it: ClipboardItem, write_blob) -> dict:
+    """编码收藏项。大的二进制负载通过 write_blob 写入独立文件，仅在 JSON 中保留摘要引用，避免 favorites.json 膨胀。"""
+    raw_ref = write_blob(it.raw_bytes) if it.raw_bytes is not None else None
+    image_ref = write_blob(it.image_bytes) if it.image_bytes is not None else None
     return {
         "created_at": it.created_at.isoformat(),
         "item_type": it.item_type,
         "text": it.text,
         "file_paths": list(it.file_paths) if it.file_paths else None,
-        "raw_b64": base64.b64encode(it.raw_bytes).decode("ascii") if it.raw_bytes is not None else None,
-        "image_b64": base64.b64encode(it.image_bytes).decode("ascii") if it.image_bytes is not None else None,
+        "raw_blob": raw_ref,
+        "image_blob": image_ref,
     }
 
 
-def _decode_item(data: dict) -> ClipboardItem | None:
+def _decode_item(data: dict, read_blob) -> ClipboardItem | None:
     try:
         created_at = datetime.fromisoformat(str(data.get("created_at") or ""))
         item_type = str(data.get("item_type") or "unknown")
         text = data.get("text")
         file_paths = data.get("file_paths")
-        raw_b64 = data.get("raw_b64")
-        image_b64 = data.get("image_b64")
-        raw_bytes = base64.b64decode(raw_b64) if raw_b64 else None
-        image_bytes = base64.b64decode(image_b64) if image_b64 else None
+        # 新格式：blob 摘要引用；旧格式：内联 base64，保持向后兼容。
+        raw_ref = data.get("raw_blob")
+        image_ref = data.get("image_blob")
+        if raw_ref:
+            raw_bytes = read_blob(str(raw_ref))
+        else:
+            raw_b64 = data.get("raw_b64")
+            raw_bytes = base64.b64decode(raw_b64) if raw_b64 else None
+        if image_ref:
+            image_bytes = read_blob(str(image_ref))
+        else:
+            image_b64 = data.get("image_b64")
+            image_bytes = base64.b64decode(image_b64) if image_b64 else None
         fp = tuple(file_paths) if isinstance(file_paths, list) else None
         return ClipboardItem(
             created_at=created_at,
@@ -112,6 +128,7 @@ class FavoritesStore:
                 self._entries.insert(0, self._entries.pop(i))
                 return fid
         self._entries.insert(0, FavoriteEntry(fav_id=fid, item=item))
+        self._enforce_limit()
         return fid
 
     def remove_by_id(self, fav_id: str) -> bool:
@@ -149,7 +166,12 @@ class FavoritesStore:
         if self.remove_by_id(fid):
             return False, fid
         self._entries.insert(0, FavoriteEntry(fav_id=fid, item=item))
+        self._enforce_limit()
         return True, fid
+
+    def _enforce_limit(self) -> None:
+        if len(self._entries) > MAX_FAVORITES:
+            del self._entries[MAX_FAVORITES:]
 
     def move(self, from_index: int, to_index: int) -> None:
         if from_index < 0 or from_index >= len(self._entries):
@@ -180,6 +202,43 @@ class FavoritesStore:
     def path(self) -> str:
         return os.path.join(default_app_dir(), "favorites.json")
 
+    def _blob_dir(self) -> str:
+        return os.path.join(default_app_dir(), "favorites_blobs")
+
+    def _write_blob(self, b: bytes) -> str:
+        digest = hashlib.sha1(b).hexdigest()
+        d = self._blob_dir()
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, digest + ".bin")
+        if not os.path.exists(p):
+            with open(p, "wb") as f:
+                f.write(b)
+        return digest
+
+    def _read_blob(self, digest: str) -> bytes | None:
+        p = os.path.join(self._blob_dir(), digest + ".bin")
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
+
+    def _prune_blobs(self, referenced: set[str]) -> None:
+        d = self._blob_dir()
+        if not os.path.isdir(d):
+            return
+        try:
+            for name in os.listdir(d):
+                if not name.endswith(".bin"):
+                    continue
+                if name[:-4] not in referenced:
+                    try:
+                        os.remove(os.path.join(d, name))
+                    except Exception:
+                        log.debug("删除未引用收藏 blob 失败: %s", name, exc_info=True)
+        except Exception:
+            log.debug("清理收藏 blob 目录异常", exc_info=True)
+
     def load(self) -> None:
         path = self.path()
         try:
@@ -197,7 +256,7 @@ class FavoritesStore:
                 item_data = row.get("item")
                 if not fav_id or not isinstance(item_data, dict):
                     continue
-                it = _decode_item(item_data)
+                it = _decode_item(item_data, self._read_blob)
                 if it is None:
                     continue
                 entries.append(FavoriteEntry(fav_id=fav_id, item=it))
@@ -206,6 +265,15 @@ class FavoritesStore:
     def save(self) -> None:
         path = self.path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        data = {"favorites": [{"id": e.fav_id, "item": _encode_item(e.item)} for e in self._entries]}
+        referenced: set[str] = set()
+
+        def write_blob(b: bytes) -> str:
+            digest = self._write_blob(b)
+            referenced.add(digest)
+            return digest
+
+        favorites = [{"id": e.fav_id, "item": _encode_item(e.item, write_blob)} for e in self._entries]
+        data = {"favorites": favorites}
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        self._prune_blobs(referenced)

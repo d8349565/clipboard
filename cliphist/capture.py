@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Final
 
 log = logging.getLogger(__name__)
@@ -9,7 +10,7 @@ import win32clipboard
 import win32con
 
 from .clipboard_util import open_clipboard
-from .models import ClipboardItem
+from .models import ClipboardItem, MAX_IMAGE_BYTES, MAX_RICH_RAW_BYTES
 from .text_util import (
     html_fragment_preview as _extract_html_fragment_preview,
     rtf_to_plain_text as _rtf_preview,
@@ -18,8 +19,14 @@ from .text_util import (
 
 HTML_FORMAT_NAME: Final[str] = "HTML Format"
 RTF_FORMAT_NAME: Final[str] = "Rich Text Format"
-MAX_IMAGE_BYTES: Final[int] = 8 * 1024 * 1024  # 8 MB
-MAX_RICH_RAW_BYTES: Final[int] = 2 * 1024 * 1024  # 2 MB
+
+
+@dataclass(frozen=True, slots=True)
+class OversizedImageNotice:
+    """剪贴板中存在超过大小上限的图片，已跳过记录。用于提示用户而非静默丢弃。"""
+
+    size: int
+    limit: int
 
 _cached_html_fmt: int | None = None
 _cached_rtf_fmt: int | None = None
@@ -54,8 +61,10 @@ def _to_bytes(v: object) -> bytes | None:
         return None
 
 
-def _capture_image_bytes(max_bytes: int = MAX_IMAGE_BYTES) -> bytes | None:
+def _capture_image_bytes(max_bytes: int = MAX_IMAGE_BYTES) -> tuple[bytes | None, int]:
+    """返回 (图片字节, 超限大小)。超限大小 > 0 表示存在被跳过的过大图片。"""
     dibv5_fmt = getattr(win32con, "CF_DIBV5", 17)
+    oversized = 0
     for fmt in (dibv5_fmt, win32con.CF_DIB):
         if not win32clipboard.IsClipboardFormatAvailable(fmt):
             continue
@@ -64,12 +73,13 @@ def _capture_image_bytes(max_bytes: int = MAX_IMAGE_BYTES) -> bytes | None:
             continue
         if len(dib) > max_bytes:
             log.warning("Image payload exceeds limit (%d bytes), skipped", len(dib))
+            oversized = len(dib)
             continue
-        return dib
-    return None
+        return dib, 0
+    return None, oversized
 
 
-def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
+def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImageNotice | None:
     with open_clipboard(hwnd):
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
             file_paths = tuple(win32clipboard.GetClipboardData(win32con.CF_HDROP))
@@ -123,12 +133,14 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | None:
                 text=str(text),
             )
 
-        image_bytes = _capture_image_bytes(MAX_IMAGE_BYTES)
+        image_bytes, oversized = _capture_image_bytes(MAX_IMAGE_BYTES)
         if image_bytes:
             return ClipboardItem(
                 created_at=ClipboardItem.now_utc(),
                 item_type="image",
                 raw_bytes=image_bytes,
             )
+        if oversized:
+            return OversizedImageNotice(size=oversized, limit=MAX_IMAGE_BYTES)
 
     return None

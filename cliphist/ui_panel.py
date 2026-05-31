@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import re
+
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
@@ -31,8 +34,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-import re
 
 from .models import ClipboardItem
 from .text_util import (
@@ -502,9 +503,7 @@ def _favorite_title(item: ClipboardItem, max_len: int = 150) -> str:
     if item.item_type == "files":
         paths = item.file_paths or ()
         if paths:
-            import os as _os
-
-            name = _os.path.basename(paths[0].rstrip("\\/")) or paths[0]
+            name = os.path.basename(paths[0].rstrip("\\/")) or paths[0]
             if len(paths) > 1:
                 name = f"{name} +{len(paths) - 1}"
             return name if len(name) <= max_len else name[: max_len - 1] + "…"

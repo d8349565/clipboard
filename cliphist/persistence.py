@@ -7,10 +7,7 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
-from .models import ClipboardItem, ClipboardItemType, _bytes_hash
-
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_RICH_RAW_BYTES = 2 * 1024 * 1024
+from .models import ClipboardItem, ClipboardItemType, _bytes_hash, MAX_IMAGE_BYTES, MAX_RICH_RAW_BYTES
 
 
 class SQLiteHistoryStore:

@@ -13,7 +13,6 @@ import win32con
 import win32gui
 
 from .capture import capture_clipboard
-from .models import ClipboardItem
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -29,7 +28,7 @@ class HotkeyEvent:
     hotkey_id: int
 
 
-EventCallback = Callable[[ClipboardItem | HotkeyEvent], None]
+EventCallback = Callable[[object], None]
 
 
 class ClipboardListener:

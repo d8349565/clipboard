@@ -8,6 +8,10 @@ from typing import Literal, Sequence
 
 ClipboardItemType = Literal["text", "files", "image", "html", "rtf", "unknown"]
 
+# 集中定义负载大小上限，供 capture/persistence 共用，避免各处重复定义。
+MAX_IMAGE_BYTES: int = 8 * 1024 * 1024  # 8 MB
+MAX_RICH_RAW_BYTES: int = 2 * 1024 * 1024  # 2 MB
+
 
 def _bytes_hash(b: bytes) -> str:
     """Return a short hex digest for deduplication without keeping full bytes in memory."""

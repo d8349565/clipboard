@@ -15,6 +15,7 @@ from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QStyle, QSystemTrayIcon
 
 from .autostart import is_autostart_enabled, set_autostart_enabled
+from .capture import OversizedImageNotice
 from .favorites import FavoritesStore, item_fingerprint
 from .hotkeys import HotkeySpec, parse_hotkey_sequence
 from .models import ClipboardItem
@@ -169,6 +170,11 @@ class ClipHistApp:
                 self._set_paused(not self.paused)
             return
 
+        if isinstance(evt, OversizedImageNotice):
+            if not self.paused:
+                self._notify_oversized_image(evt)
+            return
+
         if isinstance(evt, ClipboardItem):
             if self.paused:
                 return
@@ -214,6 +220,19 @@ class ClipHistApp:
             return
         self.paused = paused
         self._sync_ui_state()
+
+    def _notify_oversized_image(self, notice: OversizedImageNotice) -> None:
+        size_mb = notice.size / (1024 * 1024)
+        limit_mb = notice.limit / (1024 * 1024)
+        try:
+            self.tray.showMessage(
+                "ClipHist",
+                f"复制的图片约 {size_mb:.1f} MB，超过 {limit_mb:.0f} MB 上限，未加入历史。",
+                QSystemTrayIcon.Information,
+                4000,
+            )
+        except Exception:
+            log.debug("显示超大图片提示异常", exc_info=True)
 
     def _clear_history(self) -> None:
         if not self._confirm_clear():
