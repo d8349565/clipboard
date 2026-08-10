@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import os
 from typing import Callable
 
 from PySide6.QtCore import QPoint, Qt
@@ -26,14 +27,25 @@ from PySide6.QtWidgets import (
 from .settings import AppSettings, MAX_ITEMS_LIMIT, default_db_path
 
 
-ApplySettings = Callable[[str, str, int, bool, int, int, str], tuple[bool, str | None]]
+ApplySettings = Callable[[str, str, int, bool, bool, bool, int, int, str], tuple[bool, str | None]]
+BackupDatabase = Callable[[str], tuple[bool, str | None]]
+DatabaseSummary = Callable[[str], str]
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: AppSettings, apply_settings: ApplySettings, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        apply_settings: ApplySettings,
+        backup_database: BackupDatabase | None = None,
+        database_summary: DatabaseSummary | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._settings = settings
         self._apply_settings = apply_settings
+        self._backup_database = backup_database
+        self._database_summary = database_summary
         self._drag_pos: QPoint | None = None
 
         self.setWindowTitle("设置")
@@ -68,6 +80,8 @@ class SettingsDialog(QDialog):
         self._hotkey_show = QKeySequenceEdit(card)
         self._hotkey_pause = QKeySequenceEdit(card)
         self._max_items = QSpinBox(card)
+        self._persist = QCheckBox("启用 SQLite 持久化历史", card)
+        self._auto_paste = QCheckBox("选择记录后直接粘贴到原窗口", card)
         self._autostart = QCheckBox("开机时随 Windows 启动 ClipHist", card)
         self._panel_width = QSpinBox(card)
         self._panel_height = QSpinBox(card)
@@ -76,6 +90,8 @@ class SettingsDialog(QDialog):
         self._max_items.setRange(50, MAX_ITEMS_LIMIT)
         self._max_items.setSingleStep(50)
         self._max_items.setValue(settings.max_items)
+        self._persist.setChecked(settings.persist_enabled)
+        self._auto_paste.setChecked(settings.auto_paste)
         self._autostart.setChecked(settings.autostart_enabled)
         self._panel_width.setRange(400, 1600)
         self._panel_width.setSingleStep(20)
@@ -97,26 +113,47 @@ class SettingsDialog(QDialog):
         btn_browse.setToolTip("选择数据库文件位置")
         btn_browse.setFixedHeight(30)
         btn_browse.clicked.connect(self._browse_db_path)
+        btn_open_dir = QToolButton(card)
+        btn_open_dir.setObjectName("settingsBtn")
+        btn_open_dir.setText("打开目录")
+        btn_open_dir.setToolTip("打开数据库和日志所在目录")
+        btn_open_dir.setFixedHeight(30)
+        btn_open_dir.clicked.connect(self._open_data_folder)
+        btn_backup = QToolButton(card)
+        btn_backup.setObjectName("settingsBtn")
+        btn_backup.setText("备份")
+        btn_backup.setToolTip("创建一致的 SQLite 数据库备份")
+        btn_backup.setFixedHeight(30)
+        btn_backup.clicked.connect(self._backup_db)
         db_row = QHBoxLayout()
         db_row.setContentsMargins(0, 0, 0, 0)
         db_row.setSpacing(6)
         db_row.addWidget(self._db_path, 1)
         db_row.addWidget(btn_browse)
+        db_row.addWidget(btn_open_dir)
+        db_row.addWidget(btn_backup)
         db_row_widget = QWidget(card)
         db_row_widget.setLayout(db_row)
+        self._db_summary = QLabel("", card)
+        self._db_summary.setObjectName("settingsHint")
+        self._db_path.textChanged.connect(self._refresh_db_summary)
 
         form = QFormLayout()
         form.addRow("打开面板热键：", self._hotkey_show)
         form.addRow("暂停热键：", self._hotkey_pause)
         form.addRow("历史条数：", self._max_items)
+        form.addRow("持久化：", self._persist)
+        form.addRow("直接粘贴：", self._auto_paste)
         form.addRow("开机自启：", self._autostart)
         form.addRow("面板宽度：", self._panel_width)
         form.addRow("面板高度：", self._panel_height)
         form.addRow("数据库文件：", db_row_widget)
+        form.addRow("数据库状态：", self._db_summary)
 
         hint = QLabel(
             "热键支持 Ctrl/Alt/Shift/Win 与 A-Z、0-9、方向键、F1-F24 的组合。"
-            "历史条数控制内存中保留的记录数量。数据库文件留空则使用默认位置。",
+            "直接粘贴启用后，Enter/双击会粘贴到打开面板前的窗口；Ctrl+Enter 始终仅复制。"
+            "数据库文件留空则使用默认位置。",
             card,
         )
         hint.setWordWrap(True)
@@ -154,8 +191,9 @@ class SettingsDialog(QDialog):
         root.addWidget(card)
         self.setLayout(root)
 
-        self.resize(460, 360)
+        self.resize(520, 480)
         self._apply_styles()
+        self._refresh_db_summary()
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -277,10 +315,51 @@ class SettingsDialog(QDialog):
         if path:
             self._db_path.setText(path)
 
+    def _open_data_folder(self) -> None:
+        path = self._db_path.text().strip() or default_db_path()
+        folder = os.path.dirname(os.path.abspath(path))
+        try:
+            os.makedirs(folder, exist_ok=True)
+            os.startfile(folder)  # type: ignore[attr-defined]
+        except Exception as exc:
+            QMessageBox.warning(self, "打开目录", f"无法打开数据目录：{exc}")
+
+    def _refresh_db_summary(self) -> None:
+        path = self._db_path.text().strip() or default_db_path()
+        if self._database_summary is None:
+            self._db_summary.setText("未提供状态信息")
+            return
+        try:
+            self._db_summary.setText(self._database_summary(path))
+        except Exception:
+            self._db_summary.setText("数据库状态不可用")
+
+    def _backup_db(self) -> None:
+        if self._backup_database is None:
+            QMessageBox.warning(self, "备份数据库", "当前版本未提供备份功能")
+            return
+        current = self._db_path.text().strip() or default_db_path()
+        default_backup = os.path.splitext(current)[0] + "-backup.sqlite3"
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "备份数据库",
+            default_backup,
+            "SQLite 数据库 (*.sqlite3 *.db);;所有文件 (*.*)",
+        )
+        if not target:
+            return
+        ok, message = self._backup_database(target)
+        if ok:
+            QMessageBox.information(self, "备份数据库", message or "备份完成")
+        else:
+            QMessageBox.warning(self, "备份数据库", message or "备份失败")
+
     def _reset_defaults(self) -> None:
         self._hotkey_show.setKeySequence(QKeySequence("Alt+C"))
         self._hotkey_pause.setKeySequence(QKeySequence("Alt+P"))
         self._max_items.setValue(1000)
+        self._persist.setChecked(False)
+        self._auto_paste.setChecked(False)
         self._autostart.setChecked(False)
         self._panel_width.setValue(640)
         self._panel_height.setValue(620)
@@ -298,6 +377,8 @@ class SettingsDialog(QDialog):
             show_seq,
             pause_seq,
             int(self._max_items.value()),
+            self._persist.isChecked(),
+            self._auto_paste.isChecked(),
             self._autostart.isChecked(),
             int(self._panel_width.value()),
             int(self._panel_height.value()),

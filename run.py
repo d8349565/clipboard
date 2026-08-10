@@ -2,14 +2,36 @@ import os
 import sys
 import ctypes
 import logging
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stderr or open(os.devnull, "w")),
-    ],
-)
+
+def _configure_logging() -> None:
+    handlers: list[logging.Handler] = []
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler(sys.stderr))
+    try:
+        app_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "ClipHist")
+        os.makedirs(app_dir, exist_ok=True)
+        handlers.append(
+            RotatingFileHandler(
+                os.path.join(app_dir, "cliphist.log"),
+                maxBytes=1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+        )
+    except Exception:
+        pass
+    if not handlers:
+        handlers.append(logging.NullHandler())
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+
+_configure_logging()
 
 
 _SINGLE_INSTANCE_MUTEX = "Local\\ClipHist.SingleInstance"

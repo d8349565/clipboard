@@ -3,13 +3,16 @@
 
 param(
     [string]$Python = "python",
-    [switch]$UseUpx = $true
+    [switch]$UseUpx = $true,
+    [ValidateSet("onefile", "onedir")]
+    [string]$Mode = "onefile"
 )
 
 $ErrorActionPreference = "Stop"
 
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 Set-Location $projectRoot
+$buildStart = Get-Date
 
 # 1. Create clean venv for smaller build size
 $venvDir = Join-Path $projectRoot ".build_venv"
@@ -27,13 +30,16 @@ Write-Host "Installing build dependencies into venv..."
 & $venvPython -m pip install -r requirements.txt --quiet
 & $venvPython -m pip install pyinstaller --quiet
 
-# 2. Generate icon if not exists
+# 2. Ensure application icon exists (generate only if a generator script is present)
 $iconPath = Join-Path $projectRoot "assets\icon.ico"
 if (-not (Test-Path $iconPath)) {
-    Write-Host "Generating application icon..."
-    & $venvPython generate_icon.py
+    $iconGen = Join-Path $projectRoot "generate_icon.py"
+    if (Test-Path $iconGen) {
+        Write-Host "Generating application icon..."
+        & $venvPython $iconGen
+    }
     if (-not (Test-Path $iconPath)) {
-        Write-Warning "Icon generation failed, building without icon."
+        Write-Warning "Icon not found, building without icon."
         $iconPath = $null
     }
 }
@@ -48,10 +54,10 @@ $pyinstallerArgs = @(
     "--noconfirm",
     "--clean",
     "--windowed",
-    "--onefile",
     "--name", "ClipHist",
     "--optimize", "2"
 )
+$pyinstallerArgs += "--$Mode"
 
 # Icon parameter (Windows uses semicolon separator)
 if ($iconPath -and (Test-Path $iconPath)) {
@@ -60,12 +66,9 @@ if ($iconPath -and (Test-Path $iconPath)) {
     $pyinstallerArgs += @("--add-data", $iconData)
 }
 
-# PySide6 plugins and data
-$pysidePluginsSrc = $env:PYTHONHOME + "\Lib\site-packages\PySide6\plugins"
-if (Test-Path $pysidePluginsSrc) {
-    $pysideData = $pysidePluginsSrc + ";PySide6\plugins"
-    $pyinstallerArgs += @("--add-data", $pysideData)
-}
+# PyInstaller's PySide6 hook discovers the required Qt plugins. Adding the
+# complete plugins directory here duplicated unused binaries and inflated the
+# portable executable.
 
 $pyinstallerArgs += @(
     "--exclude-module", "pytest",
@@ -128,16 +131,19 @@ $pyinstallerArgs += @(
     "--hidden-import", "win32clipboard",
     "--hidden-import", "win32com",
     "--hidden-import", "win32com.client",
-    "--hidden-import", "win32com.gen_py",
     "--hidden-import", "pythoncom",
     "--hidden-import", "pywintypes",
     "run.py"
 )
 
-Write-Host "Building executable (size-optimized onefile)..."
+Write-Host "Building executable ($Mode)..."
 & $venvPython -m PyInstaller @pyinstallerArgs
 
-$exePath = Join-Path $projectRoot "dist\ClipHist.exe"
+$exePath = if ($Mode -eq "onedir") {
+    Join-Path $projectRoot "dist\ClipHist\ClipHist.exe"
+} else {
+    Join-Path $projectRoot "dist\ClipHist.exe"
+}
 if (-not (Test-Path $exePath)) {
     throw "Build failed: $exePath not found."
 }
@@ -163,7 +169,8 @@ if ($UseUpx) {
 }
 
 $sizeMB = [math]::Round(((Get-Item $exePath).Length / 1MB), 2)
-Write-Host "Done: $exePath ($sizeMB MB)"
+$elapsed = [math]::Round(((Get-Date) - $buildStart).TotalSeconds, 1)
+Write-Host "Done: $exePath ($sizeMB MB, ${elapsed}s)"
 
 # Cleanup build venv
 Write-Host "Cleaning up build venv..."

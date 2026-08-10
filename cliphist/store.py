@@ -52,6 +52,22 @@ class ClipboardHistory:
                     return True
         return False
 
+    def remove_many(self, items: list[ClipboardItem]) -> int:
+        if not items:
+            return 0
+        identities = {id(item) for item in items}
+        fingerprints = {item._fingerprint for item in items if item._fingerprint}
+        with self._lock:
+            before = len(self._items)
+            kept = [
+                current
+                for current in self._items
+                if id(current) not in identities
+                and not (current._fingerprint and current._fingerprint in fingerprints)
+            ]
+            self._items = deque(kept, maxlen=self._max_items)
+            return before - len(self._items)
+
     def items(self) -> list[ClipboardItem]:
         with self._lock:
             return list(self._items)

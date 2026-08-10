@@ -4,9 +4,6 @@ import os
 import sys
 from pathlib import Path
 
-from win32com.client import Dispatch
-
-
 _STARTUP_LINK_NAME = "ClipHist.lnk"
 
 
@@ -37,6 +34,10 @@ def set_autostart_enabled(enabled: bool) -> None:
 
 
 def _create_shortcut(link_path: str) -> None:
+    # Import COM lazily. Importing win32com at application startup may rebuild
+    # its generated cache even when autostart settings are never changed.
+    from win32com.client import Dispatch
+
     shell = Dispatch("WScript.Shell")
     shortcut = shell.CreateShortcut(link_path)
 

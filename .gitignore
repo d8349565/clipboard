@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 
 .pytest_cache/
+.pytest_tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -13,7 +14,6 @@ htmlcov/
 venv/
 ENV/
 env/
-tests
 .idea/
 .vscode/
 .trae/

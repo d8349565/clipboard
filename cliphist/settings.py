@@ -17,6 +17,7 @@ MAX_ITEMS_LIMIT: int = 10000
 class AppSettings:
     max_items: int = 1000
     persist_enabled: bool = False
+    auto_paste: bool = False
     autostart_enabled: bool = False
     db_path: str | None = None
     hotkey_show_panel: str = "Alt+C"
@@ -51,6 +52,7 @@ def load_settings() -> AppSettings:
         max_items = 1000
     max_items = min(max_items, MAX_ITEMS_LIMIT)
     persist_enabled = bool(data.get("persist_enabled", False))
+    auto_paste = bool(data.get("auto_paste", False))
     autostart_enabled = bool(data.get("autostart_enabled", is_autostart_enabled()))
     db_path = data.get("db_path") or None
     hotkey_show_panel = str(data.get("hotkey_show_panel") or "Alt+C")
@@ -62,6 +64,7 @@ def load_settings() -> AppSettings:
     return AppSettings(
         max_items=max_items,
         persist_enabled=persist_enabled,
+        auto_paste=auto_paste,
         autostart_enabled=autostart_enabled,
         db_path=db_path,
         hotkey_show_panel=hotkey_show_panel,

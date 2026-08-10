@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -11,12 +14,15 @@ from .models import ClipboardItem, ClipboardItemType, _bytes_hash, MAX_IMAGE_BYT
 
 
 class SQLiteHistoryStore:
+    _TRIM_BATCH = 50
+
     def __init__(self, db_path: str) -> None:
         self._path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
+        self._count_hint = self.count()
 
     @property
     def path(self) -> str:
@@ -37,6 +43,9 @@ class SQLiteHistoryStore:
             """
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON clipboard_items(created_at_ms DESC)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_created_at_id ON clipboard_items(created_at_ms DESC, id DESC)"
+        )
         self._ensure_column("image_bytes", "BLOB")
         self._ensure_column("fingerprint", "TEXT")
         self._conn.commit()
@@ -60,10 +69,17 @@ class SQLiteHistoryStore:
         return row_id
 
     def insert_and_trim(self, item: ClipboardItem, limit: int) -> int:
-        """Insert an item and trim old rows in a single transaction (one commit)."""
+        """Insert and periodically trim in one transaction.
+
+        Trimming every clipboard event rescans the retained index. A small
+        overflow window amortizes that work while load_recent still enforces
+        the user-visible limit.
+        """
         row_id = self._do_insert(item)
-        if limit > 0:
+        self._count_hint += 1
+        if limit > 0 and self._count_hint > limit + self._TRIM_BATCH:
             self._do_trim(limit)
+            self._count_hint = limit
         self._conn.commit()
         return row_id
 
@@ -83,6 +99,7 @@ class SQLiteHistoryStore:
             return
         self._do_trim(limit)
         self._conn.commit()
+        self._count_hint = min(self._count_hint, limit)
 
     def _do_trim(self, limit: int) -> None:
         self._conn.execute(
@@ -90,7 +107,7 @@ class SQLiteHistoryStore:
             DELETE FROM clipboard_items
             WHERE id NOT IN (
               SELECT id FROM clipboard_items
-              ORDER BY created_at_ms DESC
+              ORDER BY created_at_ms DESC, id DESC
               LIMIT ?
             )
             """,
@@ -100,6 +117,7 @@ class SQLiteHistoryStore:
     def clear(self) -> None:
         self._conn.execute("DELETE FROM clipboard_items")
         self._conn.commit()
+        self._count_hint = 0
         # DELETE 不会回收已分配的磁盘空间，VACUUM 重建数据库以缩小文件体积。
         # WAL 模式下需先做一次检查点，确保 WAL 中的删除已合并进主库。
         try:
@@ -116,6 +134,7 @@ class SQLiteHistoryStore:
             for item in items:
                 self._do_insert(item)
             self._conn.commit()
+            self._count_hint = len(items)
         except Exception:
             self._conn.rollback()
             raise
@@ -124,7 +143,7 @@ class SQLiteHistoryStore:
         if limit <= 0:
             return []
         cur = self._conn.execute(
-            "SELECT id, created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes FROM clipboard_items ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+            "SELECT id, created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes FROM clipboard_items ORDER BY created_at_ms DESC, id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         )
         items: list[ClipboardItem] = []
@@ -149,7 +168,7 @@ class SQLiteHistoryStore:
                     raw_bytes=raw_bytes,
                     image_bytes=image_bytes,
                     db_id=row_id,
-                )
+                ).prepared()
             )
         return items
 
@@ -160,7 +179,7 @@ class SQLiteHistoryStore:
         cur = self._conn.execute(
             "SELECT id, created_at_ms, item_type, text, file_paths_json,"
             " LENGTH(raw_bytes), LENGTH(image_bytes), fingerprint FROM clipboard_items"
-            " ORDER BY created_at_ms DESC LIMIT ? OFFSET ?",
+            " ORDER BY created_at_ms DESC, id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         )
         items: list[ClipboardItem] = []
@@ -189,7 +208,7 @@ class SQLiteHistoryStore:
                     raw_size=raw_size,
                     image_size=img_size,
                     _fingerprint=fingerprint,
-                )
+                ).with_search_index()
             )
         return items
 
@@ -204,18 +223,37 @@ class SQLiteHistoryStore:
             return None, None
         return row[0], row[1]
 
-    def update_text(self, db_id: int, text: str | None) -> None:
+    def update_text(self, db_id: int, text: str | None, fingerprint: str | None = None) -> None:
         """Update only the text field for an item (used by text editing)."""
         self._conn.execute(
-            "UPDATE clipboard_items SET text = ? WHERE id = ?",
-            (text, db_id),
+            "UPDATE clipboard_items SET text = ?, fingerprint = ? WHERE id = ?",
+            (text, fingerprint, db_id),
         )
         self._conn.commit()
+
+    def delete_by_ids(self, db_ids: list[int]) -> int:
+        ids = sorted({int(value) for value in db_ids if int(value) > 0})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        cur = self._conn.execute(f"DELETE FROM clipboard_items WHERE id IN ({placeholders})", ids)
+        self._conn.commit()
+        deleted = max(0, int(cur.rowcount or 0))
+        self._count_hint = max(0, self._count_hint - deleted)
+        return deleted
 
     def count(self) -> int:
         cur = self._conn.execute("SELECT COUNT(*) FROM clipboard_items")
         row = cur.fetchone()
         return row[0] if row else 0
+
+    def backup_to(self, target_path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+        destination = sqlite3.connect(target_path)
+        try:
+            self._conn.backup(destination)
+        finally:
+            destination.close()
 
 
 def _coerce_item_type(v: str) -> ClipboardItemType:
@@ -240,3 +278,44 @@ def _sanitize_payload(
             return None, None
         return raw_bytes, None
     return raw_bytes, None
+
+
+class AsyncSQLiteHistoryStore:
+    """Serialize every SQLite operation on one dedicated worker thread."""
+
+    def __init__(self, db_path: str) -> None:
+        self._path = db_path
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ClipHistSQLite")
+        self._backend: SQLiteHistoryStore | None = None
+        self._closed = False
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def _invoke(self, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if self._backend is None:
+            self._backend = SQLiteHistoryStore(self._path)
+        return getattr(self._backend, method)(*args, **kwargs)
+
+    def submit(self, method: str, *args: Any, **kwargs: Any) -> Future:
+        if self._closed:
+            raise RuntimeError("history store is closed")
+        return self._executor.submit(self._invoke, method, args, kwargs)
+
+    def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        return self.submit(method, *args, **kwargs).result()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        def _close() -> None:
+            if self._backend is not None:
+                self._backend.close()
+
+        try:
+            self._executor.submit(_close).result()
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=False)

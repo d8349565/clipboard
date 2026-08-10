@@ -8,6 +8,8 @@ ClipHist 是一个 Windows 剪贴板历史管理工具，常驻系统托盘，�
 - **快速搜索**：输入关键字即可筛选历史记录
 - **分类筛选**：按文本/文件/图片/HTML/RTF/链接类型一键过滤
 - **一键复用**：双击记录即可写回剪贴板，直接粘贴
+- **可选直接粘贴**：选择记录后可自动回到原窗口粘贴，`Ctrl+Enter` 始终仅复制
+- **精细清理**：支持单条或多选删除历史，无需清空全部记录
 - **收藏管理**：收藏重要记录，支持拖拽排序和删除
 - **文本编辑**：右键可直接编辑文本记录内容
 - **暂停监听**：可临时暂停剪贴板记录
@@ -36,12 +38,20 @@ powershell -ExecutionPolicy Bypass -File build_windows.ps1
 
 生成的 EXE 文件位于 `dist\ClipHist.exe`。
 
+如需冷启动更快的目录版，可执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_windows.ps1 -Mode onedir
+```
+
 ## 快捷键
 
 | 功能          | 默认快捷键 |
 | ------------- | ---------- |
 | 打开面板      | `Alt+C`  |
 | 暂停/恢复监听 | `Alt+P`  |
+| 仅复制选中记录 | `Ctrl+Enter` |
+| 删除选中记录 | `Delete` |
 
 > 如果快捷键被其他软件占用，程序会自动尝试其他可用组合。你也可以在设置中手动修改快捷键。
 
@@ -59,9 +69,12 @@ powershell -ExecutionPolicy Bypass -File build_windows.ps1
 - 打开面板快捷键
 - 暂停监听快捷键
 - 历史记录保留条数
+- 是否启用 SQLite 持久化
+- 选择记录后是否直接粘贴到原窗口
 - 开机自启
 - 面板宽度 / 高度
 - 数据库文件位置（留空则使用默认位置）
+- 数据库条数/占用查看、打开数据目录和一致性备份
 
 **快捷键格式**：`Ctrl/Alt/Shift/Win + A-Z/0-9/F1-F24/方向键`
 
@@ -72,6 +85,7 @@ powershell -ExecutionPolicy Bypass -File build_windows.ps1
 | 配置文件   | `%APPDATA%\ClipHist\config.json`     |
 | 收藏记录   | `%APPDATA%\ClipHist\favorites.json`  |
 | 历史数据库 | `%APPDATA%\ClipHist\history.sqlite3`（默认，可在设置中自定义） |
+| 运行日志     | `%APPDATA%\ClipHist\cliphist.log`                           |
 
 > 在设置中更改数据库位置后，已有历史会自动迁移到新位置。清空历史会自动回收数据库占用的磁盘空间。
 

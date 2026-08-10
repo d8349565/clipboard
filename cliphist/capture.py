@@ -87,7 +87,7 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                 created_at=ClipboardItem.now_utc(),
                 item_type="files",
                 file_paths=file_paths,
-            )
+            ).prepared()
 
         html_fmt = _get_html_fmt()
         if win32clipboard.IsClipboardFormatAvailable(html_fmt):
@@ -104,7 +104,7 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                 item_type="html",
                 text=preview,
                 raw_bytes=keep_raw,
-            )
+            ).prepared()
 
         rtf_fmt = _get_rtf_fmt()
         if win32clipboard.IsClipboardFormatAvailable(rtf_fmt):
@@ -121,7 +121,7 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                 item_type="rtf",
                 text=preview,
                 raw_bytes=keep_raw,
-            )
+            ).prepared()
 
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
             text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
@@ -131,7 +131,7 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                 created_at=ClipboardItem.now_utc(),
                 item_type="text",
                 text=str(text),
-            )
+            ).prepared()
 
         image_bytes, oversized = _capture_image_bytes(MAX_IMAGE_BYTES)
         if image_bytes:
@@ -139,7 +139,7 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                 created_at=ClipboardItem.now_utc(),
                 item_type="image",
                 raw_bytes=image_bytes,
-            )
+            ).prepared()
         if oversized:
             return OversizedImageNotice(size=oversized, limit=MAX_IMAGE_BYTES)
 
