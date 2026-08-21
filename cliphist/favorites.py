@@ -125,6 +125,16 @@ class FavoritesStore:
                     return True
         return False
 
+    def remove_many_by_id(self, fav_ids: list[str]) -> int:
+        """Remove a group of favorites in one locked mutation."""
+        targets = set(fav_ids)
+        if not targets:
+            return 0
+        with self._lock:
+            before = len(self._entries)
+            self._entries = [entry for entry in self._entries if entry.fav_id not in targets]
+            return before - len(self._entries)
+
     def replace_item(self, old_item: ClipboardItem, new_item: ClipboardItem) -> bool:
         old_id = item_fingerprint(old_item)
         new_id = item_fingerprint(new_item)

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import os
-import re
 
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
 
-from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect, QPoint, QEvent
+from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect, QPoint, QEvent, QItemSelectionModel
 from PySide6.QtGui import QColor, QCursor, QDrag, QGuiApplication, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,8 +43,6 @@ from .text_util import (
     html_to_plain_text,
     rtf_to_plain_text,
 )
-
-_RE_URL = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+', re.IGNORECASE)
 
 ROLE_ITEM = int(Qt.UserRole)
 ROLE_FAV_ID = int(Qt.UserRole + 1)
@@ -90,7 +87,7 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
             ("Alt+P", "切换暂停 / 继续监听（可在设置中自定义）。"),
             ("Enter / 双击", "复制记录；启用直接粘贴后会自动粘贴到原窗口。"),
             ("Ctrl+Enter", "始终只复制，不触发直接粘贴。"),
-            ("Delete", "删除选中的历史记录；收藏标签页中删除当前收藏。"),
+            ("Delete", "删除选中的历史记录；收藏标签页中批量移出所选收藏。"),
             ("Esc", "隐藏面板。"),
             ("Ctrl+F", "聚焦搜索框。"),
             ("Alt+F", "收藏 / 取消收藏当前选中的记录。"),
@@ -101,10 +98,10 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
     (
         "★", "收藏功能",
         [
-            ("添加收藏", "选中记录后按 Alt+F，或点击工具栏星号按钮，或右键菜单选择「收藏」。"),
+            ("添加收藏", "在「全部」列表点击记录右侧星标；也可选中后按 Alt+F 或使用右键菜单。"),
             ("查看收藏", "点击「收藏」标签页，收藏内容持久保存，不受历史上限影响。"),
-            ("删除收藏", "在收藏标签页选中记录后，点击工具栏垃圾桶按钮或右键「删除收藏」。"),
-            ("调整顺序", "选中记录后点击 ▲ / ▼ 按钮，或右键「上移 / 下移」调整收藏排序。"),
+            ("批量管理", "收藏页支持 Ctrl / Shift 多选；点击「移出收藏」可一次处理多条内容。"),
+            ("调整顺序", "点击「置顶」将所选内容移到最前；右键「上移 / 下移」可精细调整。"),
             ("编辑文本", "对文本类收藏右键选择「编辑文本」，可直接修改内容后保存。"),
         ],
     ),
@@ -628,9 +625,7 @@ class _ClipItemDelegate(QStyledItemDelegate):
 
         left_pad = 12
         # Determine display type (detect links in text items)
-        display_type = it.item_type
-        if it.item_type == "text" and it.text and _RE_URL.search(it.text):
-            display_type = "link"
+        display_type = it.display_type
 
         badge_h = 22
         badge_w = 46
@@ -696,9 +691,18 @@ class _ClipItemDelegate(QStyledItemDelegate):
             fm1.elidedText(subtitle, Qt.ElideRight, w),
         )
 
-        if is_fav:
-            painter.setPen(QColor("#F59E0B") if not is_selected else QColor("#FFFFFF"))
-            painter.drawText(QRect(rect.right() - 28, rect.top(), 20, rect.height()), Qt.AlignCenter, "★")
+        painter.setPen(
+            QColor("#F59E0B")
+            if is_fav and not is_selected
+            else QColor("#94A3B8")
+            if not is_selected
+            else QColor("#FFFFFF")
+        )
+        painter.drawText(
+            QRect(rect.right() - 36, rect.top(), 28, rect.height()),
+            Qt.AlignCenter,
+            "★" if is_fav else "☆",
+        )
 
         painter.restore()
 
@@ -785,6 +789,7 @@ class ClipPanel(QWidget):
         get_favorites: Callable[[], list[tuple[str, ClipboardItem]]] | None = None,
         toggle_favorite: Callable[[ClipboardItem], tuple[bool, str | None]] | None = None,
         remove_favorite: Callable[[str], tuple[bool, str | None]] | None = None,
+        remove_favorites: Callable[[list[str]], tuple[bool, str | None]] | None = None,
         reorder_favorites: Callable[[list[str]], tuple[bool, str | None]] | None = None,
         edit_item: Callable[[ClipboardItem, ClipboardItem], tuple[bool, str | None]] | None = None,
         delete_items: Callable[[list[ClipboardItem]], tuple[bool, str | None]] | None = None,
@@ -797,6 +802,7 @@ class ClipPanel(QWidget):
         self._get_favorites = get_favorites
         self._toggle_favorite = toggle_favorite
         self._remove_favorite = remove_favorite
+        self._remove_favorites = remove_favorites
         self._reorder_favorites = reorder_favorites
         self._edit_item = edit_item
         self._delete_items = delete_items
@@ -875,6 +881,7 @@ class ClipPanel(QWidget):
         self._list_all.itemActivated.connect(lambda _: self._activate_current())
         self._list_all.setMouseTracking(True)
         self._list_all.currentItemChanged.connect(lambda *_: self._update_preview())
+        self._list_all.currentItemChanged.connect(lambda *_: self._sync_tooltips())
         self._list_all.itemEntered.connect(lambda item: self._on_item_hover(self._list_all, item))
         self._list_all.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_all.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self._list_all, pos))
@@ -882,6 +889,7 @@ class ClipPanel(QWidget):
 
         self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card, load_blobs=self._load_blobs)
         self._list_fav.setUniformItemSizes(True)
+        self._list_fav.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._delegate_fav = _ClipItemDelegate(self._list_fav, load_blobs=self._load_blobs)
         self._list_fav.setItemDelegate(self._delegate_fav)
         self._list_fav.setVerticalScrollMode(QListWidget.ScrollPerPixel)
@@ -890,6 +898,8 @@ class ClipPanel(QWidget):
         self._list_fav.itemActivated.connect(lambda _: self._activate_current())
         self._list_fav.setMouseTracking(True)
         self._list_fav.currentItemChanged.connect(lambda *_: self._update_preview())
+        self._list_fav.currentItemChanged.connect(lambda *_: self._sync_tooltips())
+        self._list_fav.itemSelectionChanged.connect(self._sync_tooltips)
         self._list_fav.itemEntered.connect(lambda item: self._on_item_hover(self._list_fav, item))
         self._list_fav.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list_fav.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self._list_fav, pos))
@@ -1045,36 +1055,35 @@ class ClipPanel(QWidget):
         toolbar.setSpacing(2)
 
         self._btn_fav = QToolButton(card)
-        self._btn_fav.setObjectName("btnIcon")
-        self._btn_fav.setIcon(self.style().standardIcon(QStyle.SP_DialogYesButton))
-        self._btn_fav.setToolTip("收藏/取消收藏")
-        self._btn_fav.setFixedSize(32, 32)
+        self._btn_fav.setObjectName("btnAction")
+        self._btn_fav.setText("☆ 收藏")
+        self._btn_fav.setToolTip("收藏当前记录（Alt+F）")
+        self._btn_fav.setFixedHeight(30)
+        self._btn_fav.setMinimumWidth(78)
         self._btn_fav.clicked.connect(self._toggle_current_favorite)
         toolbar.addWidget(self._btn_fav)
 
-        self._btn_up = QToolButton(card)
-        self._btn_up.setObjectName("btnIcon")
-        self._btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
-        self._btn_up.setToolTip("上移（仅收藏）")
-        self._btn_up.setFixedSize(32, 32)
-        self._btn_up.clicked.connect(lambda: self._move_favorite(-1))
-        toolbar.addWidget(self._btn_up)
-
-        self._btn_down = QToolButton(card)
-        self._btn_down.setObjectName("btnIcon")
-        self._btn_down.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
-        self._btn_down.setToolTip("下移（仅收藏）")
-        self._btn_down.setFixedSize(32, 32)
-        self._btn_down.clicked.connect(lambda: self._move_favorite(1))
-        toolbar.addWidget(self._btn_down)
+        self._btn_top = QToolButton(card)
+        self._btn_top.setObjectName("btnAction")
+        self._btn_top.setText("↑ 置顶")
+        self._btn_top.setToolTip("将所选收藏移到最前")
+        self._btn_top.setFixedHeight(30)
+        self._btn_top.setMinimumWidth(76)
+        self._btn_top.clicked.connect(self._move_selected_favorites_to_top)
+        toolbar.addWidget(self._btn_top)
 
         self._btn_del_fav = QToolButton(card)
-        self._btn_del_fav.setObjectName("btnIcon")
-        self._btn_del_fav.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
-        self._btn_del_fav.setToolTip("删除收藏")
-        self._btn_del_fav.setFixedSize(32, 32)
-        self._btn_del_fav.clicked.connect(self._remove_current_favorite)
+        self._btn_del_fav.setObjectName("btnDangerAction")
+        self._btn_del_fav.setText("移出收藏")
+        self._btn_del_fav.setToolTip("将所选内容移出收藏夹（Delete）")
+        self._btn_del_fav.setFixedHeight(30)
+        self._btn_del_fav.setMinimumWidth(90)
+        self._btn_del_fav.clicked.connect(self._remove_selected_favorites)
         toolbar.addWidget(self._btn_del_fav)
+
+        self._selection_label = QLabel("", card)
+        self._selection_label.setObjectName("selectionLabel")
+        toolbar.addWidget(self._selection_label)
 
         self._tabs.currentChanged.connect(lambda _: self._on_tab_changed())
 
@@ -1234,7 +1243,7 @@ class ClipPanel(QWidget):
             return
         if event.key() == Qt.Key_Delete:
             if self._tabs.currentIndex() == 1:
-                self._remove_current_favorite()
+                self._remove_selected_favorites()
             else:
                 self._delete_selected_history()
             return
@@ -1290,6 +1299,20 @@ class ClipPanel(QWidget):
         super().mouseReleaseEvent(event)
 
     def eventFilter(self, obj, event):  # type: ignore[override]
+        if (
+            event.type() == QEvent.Type.MouseButtonRelease
+            and obj is self._list_all.viewport()
+            and event.button() == Qt.LeftButton
+        ):
+            pos = event.position().toPoint()
+            if pos.x() >= self._list_all.viewport().width() - 44:
+                widget_item = self._list_all.itemAt(pos)
+                if widget_item is not None:
+                    item = widget_item.data(ROLE_ITEM)
+                    if isinstance(item, ClipboardItem):
+                        self._toggle_item_favorite(item)
+                        return True
+
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
             if key in (Qt.Key_Tab, Qt.Key_Backtab) and self._panel_has_focus():
@@ -1469,10 +1492,8 @@ class ClipPanel(QWidget):
 
     @staticmethod
     def _item_display_type(it: ClipboardItem) -> str:
-        """Return the display category for an item (detects links in text)."""
-        if it.item_type == "text" and it.text and _RE_URL.search(it.text):
-            return "link"
-        return it.item_type
+        """Return the precomputed display category for an item."""
+        return it.display_type
 
     def _apply_filter(self) -> None:
         q = (self._search.text() or "").strip().lower()
@@ -1505,6 +1526,8 @@ class ClipPanel(QWidget):
             self._filtered_items = [it for it in self._all_items if _matches_query(it)]
             self._fav_filtered = [(fid, it) for fid, it in self._favorites if _matches_query(it)]
 
+        self._tabs.setTabText(0, f"全部 {len(self._filtered_items)}")
+        self._tabs.setTabText(1, f"收藏 {len(self._fav_filtered)}")
         self._refresh_lists()
 
     def _update_preview(self) -> None:
@@ -1745,9 +1768,17 @@ class ClipPanel(QWidget):
 
     def _toggle_current_favorite(self) -> None:
         it = self._item_at_current_row()
-        if it is None or self._toggle_favorite is None:
+        if it is None:
             return
-        ok, _ = self._toggle_favorite(it)
+        self._toggle_item_favorite(it)
+
+    def _toggle_item_favorite(self, item: ClipboardItem) -> None:
+        if self._toggle_favorite is None:
+            return
+        ok, msg = self._toggle_favorite(item)
+        if not ok:
+            QMessageBox.warning(self, "收藏失败", msg or "收藏状态更新失败")
+            return
         if ok and self._get_favorites is not None:
             try:
                 self._favorites = self._get_favorites()
@@ -1756,16 +1787,82 @@ class ClipPanel(QWidget):
         self._apply_filter()
 
     def _remove_current_favorite(self) -> None:
-        fid = self._fav_id_at_current_row()
-        if fid is None or self._remove_favorite is None:
+        self._remove_selected_favorites()
+
+    def _selected_favorite_ids(self) -> list[str]:
+        selected: list[str] = []
+        for widget_item in self._list_fav.selectedItems():
+            fav_id = widget_item.data(ROLE_FAV_ID)
+            if isinstance(fav_id, str):
+                selected.append(fav_id)
+        if selected:
+            return selected
+        current = self._fav_id_at_current_row()
+        return [current] if current else []
+
+    def _remove_selected_favorites(self) -> None:
+        fav_ids = self._selected_favorite_ids()
+        if not fav_ids:
             return
-        self._remove_favorite(fid)
+
+        count = len(fav_ids)
+        reply = QMessageBox.question(
+            self,
+            "移出收藏",
+            f"确定将所选 {count} 条内容移出收藏夹吗？\n\n历史记录中的相同内容不会被删除。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if self._remove_favorites is not None:
+            ok, msg = self._remove_favorites(fav_ids)
+        elif self._remove_favorite is not None:
+            results = [self._remove_favorite(fid) for fid in fav_ids]
+            ok = all(result[0] for result in results)
+            msg = next((result[1] for result in results if not result[0]), None)
+        else:
+            return
+        if not ok:
+            QMessageBox.warning(self, "移出失败", msg or "收藏内容更新失败")
+            return
         if self._get_favorites is not None:
             try:
                 self._favorites = self._get_favorites()
             except Exception:
                 pass
         self._apply_filter()
+
+    def _move_selected_favorites_to_top(self) -> None:
+        if self._tabs.currentIndex() != 1 or self._reorder_favorites is None:
+            return
+        if (self._search.text() or "").strip() or self._active_category != "all":
+            return
+        selected_ids = set(self._selected_favorite_ids())
+        if not selected_ids:
+            return
+        current_ids = [fav_id for fav_id, _ in self._favorites]
+        ordered_selected = [fav_id for fav_id in current_ids if fav_id in selected_ids]
+        new_order = ordered_selected + [fav_id for fav_id in current_ids if fav_id not in selected_ids]
+        if new_order == current_ids:
+            return
+        ok, msg = self._reorder_favorites(new_order)
+        if not ok:
+            QMessageBox.warning(self, "置顶失败", msg or "收藏排序更新失败")
+            return
+        if self._get_favorites is not None:
+            try:
+                self._favorites = self._get_favorites()
+            except Exception:
+                pass
+        self._fav_page = 0
+        self._apply_filter()
+        self._list_fav.clearSelection()
+        for row in range(min(len(ordered_selected), self._list_fav.count())):
+            self._list_fav.item(row).setSelected(True)
+        if ordered_selected:
+            self._list_fav.setCurrentRow(0, QItemSelectionModel.NoUpdate)
 
     def _move_favorite(self, delta: int) -> None:
         if self._tabs.currentIndex() != 1 or self._reorder_favorites is None:
@@ -1794,7 +1891,8 @@ class ClipPanel(QWidget):
 
     def _on_tab_changed(self) -> None:
         self._sync_tooltips()
-        self._apply_filter()
+        self._sync_pagination()
+        self._update_preview()
 
     def _fav_id_for_item(self, it: ClipboardItem, fav_ids: set[str]) -> str | None:
         fid = None
@@ -1814,12 +1912,17 @@ class ClipPanel(QWidget):
             return
         row = widget.row(it)
         if row >= 0:
-            widget.setCurrentRow(row)
+            if it.isSelected():
+                widget.setCurrentItem(it, QItemSelectionModel.NoUpdate)
+            else:
+                widget.setCurrentItem(it, QItemSelectionModel.ClearAndSelect)
         item_obj: ClipboardItem | None = it.data(ROLE_ITEM)
         if item_obj is None:
             return
         menu = QMenu(widget)
-        act_fav = menu.addAction("收藏/取消收藏")
+        act_fav = None
+        if widget is self._list_all:
+            act_fav = menu.addAction("取消收藏" if bool(it.data(ROLE_IS_FAVORITE)) else "收藏")
         act_edit = None
         if item_obj.item_type == "text":
             act_edit = menu.addAction("编辑文本")
@@ -1827,21 +1930,27 @@ class ClipPanel(QWidget):
         act_del_history = None
         act_up = None
         act_down = None
+        act_top = None
         if widget is self._list_fav:
-            act_del = menu.addAction("删除收藏")
+            selected_count = len(self._selected_favorite_ids())
+            act_del = menu.addAction(f"移出收藏（{selected_count} 项）")
+            menu.addSeparator()
+            act_top = menu.addAction("置顶")
             act_up = menu.addAction("上移")
             act_down = menu.addAction("下移")
         else:
             act_del_history = menu.addAction("删除历史记录")
         chosen = menu.exec(widget.mapToGlobal(pos))
-        if chosen == act_fav:
+        if act_fav is not None and chosen == act_fav:
             self._toggle_current_favorite()
         elif act_edit is not None and chosen == act_edit:
             self._edit_current_text()
         elif act_del is not None and chosen == act_del:
-            self._remove_current_favorite()
+            self._remove_selected_favorites()
         elif act_del_history is not None and chosen == act_del_history:
             self._delete_selected_history()
+        elif act_top is not None and chosen == act_top:
+            self._move_selected_favorites_to_top()
         elif act_up is not None and chosen == act_up:
             self._move_favorite(-1)
         elif act_down is not None and chosen == act_down:
@@ -1866,6 +1975,7 @@ class ClipPanel(QWidget):
             _raw_hash=None,
             _image_hash=None,
             _search_index=None,
+            _display_type=None,
         ).prepared()
         ok, msg = self._edit_item(it, updated)
         if not ok:
@@ -1949,15 +2059,40 @@ class ClipPanel(QWidget):
         has_actions = bool(self._on_clear) or bool(self._on_open_settings)
         self._btn_clear.setVisible(bool(self._on_clear))
         self._btn_settings.setVisible(bool(self._on_open_settings))
-        self._btn_fav.setVisible(bool(self._toggle_favorite))
         is_fav_tab = self._tabs.currentIndex() == 1
-        self._btn_up.setVisible(is_fav_tab)
-        self._btn_down.setVisible(is_fav_tab)
-        self._btn_del_fav.setVisible(is_fav_tab and bool(self._remove_favorite))
+        current_item = self._item_at_current_row()
+        current_is_favorite = False
+        if current_item is not None:
+            current_widget_item = self._current_list().currentItem()
+            current_is_favorite = bool(
+                current_widget_item is not None
+                and current_widget_item.data(ROLE_IS_FAVORITE)
+            )
+        self._btn_fav.setVisible(not is_fav_tab and bool(self._toggle_favorite))
+        self._btn_fav.setEnabled(current_item is not None)
+        self._btn_fav.setText("★ 取消收藏" if current_is_favorite else "☆ 收藏")
+        self._btn_top.setVisible(is_fav_tab)
+        can_remove = bool(self._remove_favorites) or bool(self._remove_favorite)
+        self._btn_del_fav.setVisible(is_fav_tab and can_remove)
         self._sep1.setVisible(is_fav_tab)
-        can_reorder = is_fav_tab and not (self._search.text() or "").strip()
-        self._btn_up.setEnabled(can_reorder)
-        self._btn_down.setEnabled(can_reorder)
+        selected_count = len(self._selected_favorite_ids()) if is_fav_tab else 0
+        has_selection = selected_count > 0
+        can_reorder = (
+            is_fav_tab
+            and has_selection
+            and not (self._search.text() or "").strip()
+            and self._active_category == "all"
+        )
+        self._btn_top.setEnabled(can_reorder)
+        self._btn_top.setToolTip(
+            "将所选收藏移到最前"
+            if can_reorder or not has_selection
+            else "清除搜索和类型筛选后可调整排序"
+        )
+        self._btn_del_fav.setEnabled(has_selection)
+        self._btn_del_fav.setText(f"移出收藏 ({selected_count})" if selected_count > 1 else "移出收藏")
+        self._selection_label.setVisible(is_fav_tab and has_selection)
+        self._selection_label.setText(f"已选 {selected_count} 项")
         if has_actions:
             return
 
@@ -2063,6 +2198,37 @@ class ClipPanel(QWidget):
               background: rgba(59, 130, 246, 0.18);
               border: 1px solid rgba(37, 99, 235, 0.45);
               color: #1D4ED8;
+            }
+            QToolButton#btnAction,
+            QToolButton#btnDangerAction {
+              padding: 4px 10px;
+              border-radius: 8px;
+              border: 1px solid rgba(148, 163, 184, 0.5);
+              background: #FFFFFF;
+              color: #334155;
+              font-size: 12px;
+              font-weight: 600;
+            }
+            QToolButton#btnAction:hover {
+              background: #EFF6FF;
+              border-color: #93C5FD;
+              color: #1D4ED8;
+            }
+            QToolButton#btnDangerAction:hover {
+              background: #FEF2F2;
+              border-color: #FCA5A5;
+              color: #B91C1C;
+            }
+            QToolButton#btnAction:disabled,
+            QToolButton#btnDangerAction:disabled {
+              background: rgba(241, 245, 249, 0.7);
+              border-color: rgba(203, 213, 225, 0.6);
+              color: #94A3B8;
+            }
+            QLabel#selectionLabel {
+              color: #475569;
+              font-size: 12px;
+              padding-left: 4px;
             }
             #toolSep {
               background: rgba(148, 163, 184, 0.35);

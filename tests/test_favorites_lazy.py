@@ -63,3 +63,16 @@ def test_favorite_save_is_atomic_and_prunes_removed_blobs(tmp_path, monkeypatch)
 
     assert not blob_path.exists()
     assert not (tmp_path / "favorites.json.tmp").exists()
+
+
+def test_remove_many_favorites_in_one_mutation() -> None:
+    store = FavoritesStore()
+    items = [
+        ClipboardItem(datetime.now(timezone.utc), "text", text=f"favorite-{index}").prepared()
+        for index in range(4)
+    ]
+    ids = [store.add_or_promote(item) for item in items]
+
+    assert store.remove_many_by_id([ids[0], ids[2], "missing"]) == 2
+    assert set(store.ids()) == {ids[1], ids[3]}
+    assert store.remove_many_by_id([]) == 0

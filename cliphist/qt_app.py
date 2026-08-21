@@ -112,6 +112,7 @@ class ClipHistApp:
             get_favorites=self._get_favorites,
             toggle_favorite=self._toggle_favorite,
             remove_favorite=self._remove_favorite,
+            remove_favorites=self._remove_favorites,
             reorder_favorites=self._reorder_favorites,
             edit_item=self._edit_item,
             delete_items=self._delete_history_items,
@@ -590,8 +591,12 @@ class ClipHistApp:
         return True, None
 
     def _remove_favorite(self, fav_id: str) -> tuple[bool, str | None]:
-        if not self.favorites.remove_by_id(fav_id):
-            return False, "未找到要删除的收藏"
+        return self._remove_favorites([fav_id])
+
+    def _remove_favorites(self, fav_ids: list[str]) -> tuple[bool, str | None]:
+        removed = self.favorites.remove_many_by_id(fav_ids)
+        if removed <= 0:
+            return False, "未找到要移出的收藏"
         self._save_favorites_async("保存收藏失败")
         return True, None
 

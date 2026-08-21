@@ -18,6 +18,15 @@ def test_prepared_fingerprint_is_stable_and_reused_for_dedupe() -> None:
     assert first.dedupe_key() == second.dedupe_key()
 
 
+def test_prepared_item_caches_display_category_for_link_filter() -> None:
+    plain = _text("plain text")
+    link = _text("https://example.com/docs")
+
+    assert plain.display_type == "text"
+    assert link.display_type == "link"
+    assert link._display_type == "link"
+
+
 def test_slim_favorite_payload_still_requests_lazy_load_without_db_id() -> None:
     item = ClipboardItem(
         datetime.now(timezone.utc),

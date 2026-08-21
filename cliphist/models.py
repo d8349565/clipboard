@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, replace as _dc_replace
 from datetime import datetime, timezone
 from typing import Literal, Sequence
@@ -11,6 +12,8 @@ ClipboardItemType = Literal["text", "files", "image", "html", "rtf", "unknown"]
 # 集中定义负载大小上限，供 capture/persistence 共用，避免各处重复定义。
 MAX_IMAGE_BYTES: int = 8 * 1024 * 1024  # 8 MB
 MAX_RICH_RAW_BYTES: int = 2 * 1024 * 1024  # 2 MB
+
+_RE_URL = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+', re.IGNORECASE)
 
 
 def _bytes_hash(b: bytes) -> str:
@@ -61,6 +64,15 @@ def _search_text_lower(item: "ClipboardItem") -> str:
     return " ".join(source.replace("\r", "\n").split()).lower()
 
 
+def _display_type_for(item: "ClipboardItem", search_index: str | None = None) -> str:
+    """Return the UI category without requiring the filter to rescan raw text."""
+    if item.item_type == "text":
+        source = search_index if search_index is not None else (item.text or "")
+        if source and _RE_URL.search(source):
+            return "link"
+    return item.item_type
+
+
 @dataclass(frozen=True, slots=True)
 class ClipboardItem:
     created_at: datetime
@@ -76,10 +88,18 @@ class ClipboardItem:
     _image_hash: str | None = None
     _fingerprint: str | None = None
     _search_index: str | None = None
+    _display_type: str | None = None
 
     @staticmethod
     def now_utc() -> datetime:
         return datetime.now(timezone.utc)
+
+    @property
+    def display_type(self) -> str:
+        """Cached category used by the history and tag filters."""
+        if self._display_type is not None:
+            return self._display_type
+        return _display_type_for(self, self._search_index)
 
     def slim(self, fingerprint: str | None = None) -> ClipboardItem:
         """Return a copy without heavy blob fields, preserving metadata for display."""
@@ -103,14 +123,26 @@ class ClipboardItem:
         """Cache the content fingerprint before crossing into the Qt thread."""
         fingerprint = self._fingerprint or content_fingerprint(self)
         search_index = self._search_index if self._search_index is not None else _search_text_lower(self)
-        if fingerprint == self._fingerprint and search_index == self._search_index:
+        display_type = self._display_type or _display_type_for(self, search_index)
+        if (
+            fingerprint == self._fingerprint
+            and search_index == self._search_index
+            and display_type == self._display_type
+        ):
             return self
-        return _dc_replace(self, _fingerprint=fingerprint, _search_index=search_index)
+        return _dc_replace(
+            self,
+            _fingerprint=fingerprint,
+            _search_index=search_index,
+            _display_type=display_type,
+        )
 
     def with_search_index(self) -> ClipboardItem:
-        if self._search_index is not None:
+        search_index = self._search_index if self._search_index is not None else _search_text_lower(self)
+        display_type = self._display_type or _display_type_for(self, search_index)
+        if search_index == self._search_index and display_type == self._display_type:
             return self
-        return _dc_replace(self, _search_index=_search_text_lower(self))
+        return _dc_replace(self, _search_index=search_index, _display_type=display_type)
 
     def with_db_id(self, db_id: int) -> ClipboardItem:
         return _dc_replace(self, db_id=db_id)
