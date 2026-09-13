@@ -4,17 +4,31 @@ import json
 import logging
 import os
 import sqlite3
+import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypedDict
 
 log = logging.getLogger(__name__)
 
 from .models import ClipboardItem, ClipboardItemType, _bytes_hash, MAX_IMAGE_BYTES, MAX_RICH_RAW_BYTES
 
 
+class ImageCompactionStatus(TypedDict):
+    last_id: int
+    processed: int
+    saved_bytes: int
+    done: bool
+
+
+_RAW_ENCODING_IDENTITY = "identity"
+_RAW_ENCODING_ZLIB = "zlib"
+
+
 class SQLiteHistoryStore:
     _TRIM_BATCH = 50
+    _RAW_ENCODING_IDENTITY = _RAW_ENCODING_IDENTITY
+    _RAW_ENCODING_ZLIB = _RAW_ENCODING_ZLIB
 
     def __init__(self, db_path: str) -> None:
         self._path = db_path
@@ -38,7 +52,9 @@ class SQLiteHistoryStore:
               text TEXT,
               file_paths_json TEXT,
               raw_bytes BLOB,
-              image_bytes BLOB
+              image_bytes BLOB,
+              raw_encoding TEXT NOT NULL DEFAULT 'identity',
+              raw_size INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -47,6 +63,9 @@ class SQLiteHistoryStore:
             "CREATE INDEX IF NOT EXISTS idx_created_at_id ON clipboard_items(created_at_ms DESC, id DESC)"
         )
         self._ensure_column("image_bytes", "BLOB")
+        # Existing databases have NULL metadata and are read as identity.
+        self._ensure_column("raw_encoding", "TEXT")
+        self._ensure_column("raw_size", "INTEGER")
         self._ensure_column("fingerprint", "TEXT")
         self._conn.commit()
 
@@ -88,9 +107,20 @@ class SQLiteHistoryStore:
         file_paths_json = None
         if item.file_paths is not None:
             file_paths_json = json.dumps(list(item.file_paths), ensure_ascii=False)
+        raw_bytes, raw_encoding, raw_size = _encode_raw_payload(item.item_type, item.raw_bytes)
         cur = self._conn.execute(
-            "INSERT INTO clipboard_items(created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes, fingerprint) VALUES (?,?,?,?,?,?,?)",
-            (created_at_ms, item.item_type, item.text, file_paths_json, item.raw_bytes, item.image_bytes, item._fingerprint),
+            "INSERT INTO clipboard_items(created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes, raw_encoding, raw_size, fingerprint) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                created_at_ms,
+                item.item_type,
+                item.text,
+                file_paths_json,
+                raw_bytes,
+                item.image_bytes,
+                raw_encoding,
+                raw_size,
+                item._fingerprint,
+            ),
         )
         return cur.lastrowid or 0
 
@@ -118,12 +148,8 @@ class SQLiteHistoryStore:
         self._conn.execute("DELETE FROM clipboard_items")
         self._conn.commit()
         self._count_hint = 0
-        # DELETE 不会回收已分配的磁盘空间，VACUUM 重建数据库以缩小文件体积。
-        # WAL 模式下需先做一次检查点，确保 WAL 中的删除已合并进主库。
         try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            self._conn.execute("VACUUM;")
-            self._conn.commit()
+            self.vacuum()
         except Exception:
             log.warning("清空历史后 VACUUM 回收空间失败", exc_info=True)
 
@@ -143,11 +169,21 @@ class SQLiteHistoryStore:
         if limit <= 0:
             return []
         cur = self._conn.execute(
-            "SELECT id, created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes FROM clipboard_items ORDER BY created_at_ms DESC, id DESC LIMIT ? OFFSET ?",
+            "SELECT id, created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes, raw_encoding, raw_size FROM clipboard_items ORDER BY created_at_ms DESC, id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         )
         items: list[ClipboardItem] = []
-        for row_id, created_at_ms, item_type, text, file_paths_json, raw_bytes, image_bytes in cur.fetchall():
+        for (
+            row_id,
+            created_at_ms,
+            item_type,
+            text,
+            file_paths_json,
+            raw_bytes,
+            image_bytes,
+            raw_encoding,
+            stored_raw_size,
+        ) in cur.fetchall():
             created_at = datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
             file_paths = None
             if file_paths_json:
@@ -156,6 +192,7 @@ class SQLiteHistoryStore:
                 except Exception:
                     file_paths = None
             coerced_type = _coerce_item_type(item_type)
+            raw_bytes = _decode_raw_payload(coerced_type, raw_bytes, raw_encoding, stored_raw_size)
             raw_bytes, image_bytes = _sanitize_payload(coerced_type, raw_bytes, image_bytes)
             if coerced_type == "image" and not raw_bytes:
                 continue
@@ -178,12 +215,23 @@ class SQLiteHistoryStore:
             return []
         cur = self._conn.execute(
             "SELECT id, created_at_ms, item_type, text, file_paths_json,"
-            " LENGTH(raw_bytes), LENGTH(image_bytes), fingerprint FROM clipboard_items"
+            " LENGTH(raw_bytes), LENGTH(image_bytes), raw_encoding, raw_size, fingerprint FROM clipboard_items"
             " ORDER BY created_at_ms DESC, id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         )
         items: list[ClipboardItem] = []
-        for row_id, created_at_ms, item_type, text, file_paths_json, raw_len, img_len, fingerprint in cur.fetchall():
+        for (
+            row_id,
+            created_at_ms,
+            item_type,
+            text,
+            file_paths_json,
+            raw_len,
+            img_len,
+            raw_encoding,
+            stored_raw_size,
+            fingerprint,
+        ) in cur.fetchall():
             created_at = datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
             file_paths = None
             if file_paths_json:
@@ -192,7 +240,7 @@ class SQLiteHistoryStore:
                 except Exception:
                     file_paths = None
             coerced_type = _coerce_item_type(item_type)
-            raw_size = raw_len or 0
+            raw_size = _slim_raw_size(coerced_type, raw_len, raw_encoding, stored_raw_size)
             img_size = img_len or 0
             if coerced_type == "image" and raw_size == 0:
                 continue
@@ -215,13 +263,20 @@ class SQLiteHistoryStore:
     def load_blobs(self, db_id: int) -> tuple[bytes | None, bytes | None]:
         """Load raw_bytes and image_bytes for a single item by its DB id."""
         cur = self._conn.execute(
-            "SELECT raw_bytes, image_bytes FROM clipboard_items WHERE id = ?",
+            "SELECT item_type, raw_bytes, image_bytes, raw_encoding, raw_size FROM clipboard_items WHERE id = ?",
             (db_id,),
         )
         row = cur.fetchone()
         if row is None:
             return None, None
-        return row[0], row[1]
+        item_type, raw_bytes, image_bytes, raw_encoding, stored_raw_size = row
+        coerced_type = _coerce_item_type(item_type)
+        raw_bytes = _decode_raw_payload(coerced_type, raw_bytes, raw_encoding, stored_raw_size)
+        if coerced_type == "image":
+            raw_bytes, image_bytes = _sanitize_payload(coerced_type, raw_bytes, image_bytes)
+            if not raw_bytes:
+                return None, None
+        return raw_bytes, image_bytes
 
     def update_text(self, db_id: int, text: str | None, fingerprint: str | None = None) -> None:
         """Update only the text field for an item (used by text editing)."""
@@ -254,6 +309,197 @@ class SQLiteHistoryStore:
             self._conn.backup(destination)
         finally:
             destination.close()
+
+    def compact_images(self, after_id: int = 0, limit: int = 8) -> ImageCompactionStatus:
+        """Compress a bounded batch of legacy image rows.
+
+        Rows are visited in ascending id order. ``last_id`` can be passed as
+        ``after_id`` to resume the next batch. A row is only rewritten when a
+        valid, smaller zlib representation is available.
+        """
+        if after_id < 0:
+            raise ValueError("after_id must be >= 0")
+        if limit <= 0:
+            raise ValueError("limit must be > 0")
+
+        cur = self._conn.execute(
+            "SELECT id, raw_bytes, raw_encoding, raw_size"
+            " FROM clipboard_items"
+            " WHERE id > ? AND item_type = 'image'"
+            " ORDER BY id ASC LIMIT ?",
+            (after_id, limit + 1),
+        )
+        rows = cur.fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        last_id = after_id
+        processed = 0
+        saved_bytes = 0
+        updates: list[tuple[bytes, str, int, int]] = []
+        for row_id, raw_bytes, raw_encoding, stored_raw_size in rows:
+            last_id = int(row_id)
+            processed += 1
+            if _normalize_encoding(raw_encoding) != self._RAW_ENCODING_IDENTITY:
+                continue
+            if raw_bytes is None:
+                continue
+            try:
+                raw = bytes(raw_bytes)
+            except Exception:
+                continue
+            if not raw or len(raw) > MAX_IMAGE_BYTES:
+                continue
+            try:
+                compressed = zlib.compress(raw)
+            except Exception:
+                log.warning("压缩历史图片失败，跳过 id=%s", row_id, exc_info=True)
+                continue
+            if len(compressed) >= len(raw):
+                # Adding size metadata keeps slim mode accurate without
+                # changing the legacy payload.
+                if stored_raw_size != len(raw):
+                    updates.append((raw, self._RAW_ENCODING_IDENTITY, len(raw), int(row_id)))
+                continue
+            updates.append((compressed, self._RAW_ENCODING_ZLIB, len(raw), int(row_id)))
+            saved_bytes += len(raw) - len(compressed)
+
+        if updates:
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                self._conn.executemany(
+                    "UPDATE clipboard_items SET raw_bytes = ?, raw_encoding = ?, raw_size = ? WHERE id = ?",
+                    updates,
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+        return ImageCompactionStatus(
+            last_id=last_id,
+            processed=processed,
+            saved_bytes=saved_bytes,
+            done=not has_more,
+        )
+
+    def vacuum(self) -> None:
+        """Checkpoint the WAL and reclaim free SQLite pages."""
+        self._conn.commit()
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        self._conn.execute("VACUUM;")
+        self._conn.commit()
+
+
+def _normalize_encoding(value: object) -> str:
+    if value is None or value == "":
+        return _RAW_ENCODING_IDENTITY
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return ""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _encode_raw_payload(
+    item_type: ClipboardItemType,
+    raw_bytes: bytes | None,
+) -> tuple[bytes | None, str, int]:
+    """Encode only image DIB bytes, retaining the exact source on disk when
+    compression does not reduce the payload.
+    """
+    if raw_bytes is None:
+        return None, _RAW_ENCODING_IDENTITY, 0
+    try:
+        raw = bytes(raw_bytes)
+    except Exception:
+        return raw_bytes, _RAW_ENCODING_IDENTITY, 0
+    raw_size = len(raw)
+    if item_type != "image" or not raw or raw_size > MAX_IMAGE_BYTES:
+        return raw, _RAW_ENCODING_IDENTITY, raw_size
+    try:
+        compressed = zlib.compress(raw)
+    except Exception:
+        log.warning("压缩图片负载失败，保留原始字节", exc_info=True)
+        return raw, _RAW_ENCODING_IDENTITY, raw_size
+    if len(compressed) < raw_size:
+        return compressed, _RAW_ENCODING_ZLIB, raw_size
+    return raw, _RAW_ENCODING_IDENTITY, raw_size
+
+
+def _decompress_zlib_bounded(payload: bytes, expected_size: object) -> bytes | None:
+    """Decode one image with a hard output bound and strict stream checks."""
+    if isinstance(expected_size, bool) or not isinstance(expected_size, int):
+        return None
+    if expected_size <= 0 or expected_size > MAX_IMAGE_BYTES:
+        return None
+    # New encoded rows are always smaller than the original. This also keeps
+    # malformed rows with a huge compressed input from consuming unbounded
+    # memory in the decoder.
+    if not payload or len(payload) > MAX_IMAGE_BYTES:
+        return None
+    decoder = zlib.decompressobj()
+    try:
+        decoded = decoder.decompress(payload, expected_size + 1)
+    except zlib.error:
+        return None
+    if len(decoded) != expected_size:
+        return None
+    # A bounded decompression must consume one complete zlib stream. Reject
+    # truncated data, bytes after the stream, or output still buffered behind
+    # the output limit.
+    if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+        return None
+    return decoded
+
+
+def _decode_raw_payload(
+    item_type: ClipboardItemType,
+    raw_bytes: bytes | None,
+    raw_encoding: object,
+    raw_size: object,
+) -> bytes | None:
+    if item_type != "image":
+        return raw_bytes
+    if raw_bytes is None:
+        return None
+    try:
+        raw = bytes(raw_bytes)
+    except Exception:
+        return None
+    encoding = _normalize_encoding(raw_encoding)
+    if encoding == _RAW_ENCODING_IDENTITY:
+        return raw
+    if encoding != _RAW_ENCODING_ZLIB:
+        log.warning("未知图片编码 %r，跳过该图片负载", raw_encoding)
+        return None
+    return _decompress_zlib_bounded(raw, raw_size)
+
+
+def _slim_raw_size(
+    item_type: ClipboardItemType,
+    stored_length: object,
+    raw_encoding: object,
+    stored_raw_size: object,
+) -> int:
+    try:
+        raw_len = max(0, int(stored_length or 0))
+    except (TypeError, ValueError, OverflowError):
+        raw_len = 0
+    encoding = _normalize_encoding(raw_encoding)
+    if item_type != "image" or encoding == _RAW_ENCODING_IDENTITY:
+        return raw_len
+    if encoding != _RAW_ENCODING_ZLIB:
+        return 0
+    try:
+        original_size = int(stored_raw_size)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if original_size <= 0 or original_size > MAX_IMAGE_BYTES or raw_len <= 0 or raw_len > MAX_IMAGE_BYTES:
+        return 0
+    return original_size
 
 
 def _coerce_item_type(v: str) -> ClipboardItemType:

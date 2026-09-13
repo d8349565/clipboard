@@ -40,6 +40,9 @@ class ClipboardListener:
         self._ready_event = threading.Event()
         self._timer_lock = threading.Lock()
         self._capture_timer: threading.Timer | None = None
+        self._capture_generation = 0
+        self._capture_in_progress = False
+        self._capture_again = False
         self._hotkey_ids: set[int] = set()
 
     @property
@@ -51,10 +54,25 @@ class ClipboardListener:
             return
         self._stop_event.clear()
         self._ready_event.clear()
+        with self._timer_lock:
+            self._capture_generation += 1
+            self._capture_again = False
         self._thread = threading.Thread(target=self._run, name="ClipboardListener", daemon=True)
         self._thread.start()
 
     def stop(self, timeout_s: float = 2.0) -> None:
+        self._stop_event.set()
+        with self._timer_lock:
+            self._capture_generation += 1
+            capture_timer = self._capture_timer
+            self._capture_timer = None
+            self._capture_again = False
+        if capture_timer:
+            try:
+                capture_timer.cancel()
+            except Exception:
+                log.debug("取消剪贴板定时器异常", exc_info=True)
+
         hwnd = self._hwnd
         if hwnd:
             try:
@@ -182,6 +200,8 @@ class ClipboardListener:
         if msg == win32con.WM_DESTROY:
             self._stop_event.set()
             with self._timer_lock:
+                self._capture_generation += 1
+                self._capture_again = False
                 if self._capture_timer:
                     try:
                         self._capture_timer.cancel()
@@ -207,26 +227,57 @@ class ClipboardListener:
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
 
     def _schedule_capture(self) -> None:
+        timer_to_cancel: threading.Timer | None = None
         with self._timer_lock:
-            if self._capture_timer:
+            if self._stop_event.is_set():
+                return
+            if self._capture_in_progress:
+                # A clipboard update arrived while a large payload is being
+                # copied. Run one more debounced capture after it completes,
+                # without starting overlapping reads.
+                self._capture_again = True
+                return
+            timer_to_cancel = self._capture_timer
+            self._capture_generation += 1
+            generation = self._capture_generation
+            if timer_to_cancel:
                 try:
-                    self._capture_timer.cancel()
+                    timer_to_cancel.cancel()
                 except Exception:
-                    pass
-                self._capture_timer = None
+                    log.debug("取消剪贴板定时器异常", exc_info=True)
 
-            timer = threading.Timer(0.12, self._do_capture)
+            timer = threading.Timer(0.12, self._do_capture, args=(generation,))
             timer.daemon = True
             self._capture_timer = timer
-            timer.start()
+        timer.start()
 
-    def _do_capture(self) -> None:
+    def _do_capture(self, generation: int | None = None) -> None:
+        with self._timer_lock:
+            if generation is not None and generation != self._capture_generation:
+                return
+            self._capture_timer = None
+            if not self._hwnd or self._stop_event.is_set():
+                return
+            if self._capture_in_progress:
+                self._capture_again = True
+                return
+            self._capture_in_progress = True
+
         hwnd = self._hwnd
-        if not hwnd or self._stop_event.is_set():
-            return
         try:
             item = capture_clipboard(hwnd=hwnd)
             if item is not None:
                 self._on_event(item)
         except Exception:
             log.debug("剪贴板捕获异常", exc_info=True)
+        finally:
+            with self._timer_lock:
+                self._capture_in_progress = False
+                capture_again = (
+                    self._capture_again
+                    and not self._stop_event.is_set()
+                    and (generation is None or generation == self._capture_generation)
+                )
+                self._capture_again = False
+            if capture_again:
+                self._schedule_capture()

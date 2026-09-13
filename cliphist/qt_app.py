@@ -60,6 +60,14 @@ class _BlobResult:
 class _AsyncResult:
     operation: str
     error: str | None = None
+    result: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ClipboardWriteResult:
+    should_paste: bool
+    target: int | None
+    error: str | None = None
 
 
 class ClipHistApp:
@@ -88,10 +96,16 @@ class ClipHistApp:
         self.favorites = FavoritesStore()
         self.favorites.load()
         self._blob_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ClipHistBlob")
+        self._clipboard_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ClipHistWrite")
+        self._clipboard_write_pending = False
         self._blob_cache: OrderedDict[tuple, ClipboardItem] = OrderedDict()
         self._blob_cache_bytes = 0
         self._blob_cache_limit = 128 * 1024 * 1024
         self._pending_blob_requests: dict[tuple, list[tuple[str, bool | None]]] = {}
+        self._blob_generation = 0
+        self._compaction_active = False
+        self._compaction_after_id = 0
+        self._compaction_saved_bytes = 0
         self._previous_foreground_hwnd: int | None = None
         self._closing = False
 
@@ -125,6 +139,10 @@ class ClipHistApp:
 
         self._bridge = _Bridge()
         self._bridge.event.connect(self._handle_event)
+        self._refresh_timer = QTimer(self._bridge)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(40)
+        self._refresh_timer.timeout.connect(self._refresh_panel)
 
         self.listener = ClipboardListener(on_event=self._bridge.event.emit)
         self.listener.start()
@@ -175,6 +193,11 @@ class ClipHistApp:
         self._act_persist.setCheckable(True)
         self._act_persist.triggered.connect(lambda checked: self._enable_persistence(bool(checked)))
         menu.addAction(self._act_persist)
+
+        self._act_compact = QAction("优化数据库图片", menu)
+        self._act_compact.setToolTip("无损压缩历史图片并回收数据库空间")
+        self._act_compact.triggered.connect(self._compact_database)
+        menu.addAction(self._act_compact)
 
         act_clear = QAction("清空历史", menu)
         act_clear.triggered.connect(self._clear_history)
@@ -269,6 +292,16 @@ class ClipHistApp:
             QMessageBox.warning(self.panel if self.panel.isVisible() else None, "打开目录", str(exc))
 
     def _handle_event(self, evt: object) -> None:
+        if isinstance(evt, _ClipboardWriteResult):
+            self._clipboard_write_pending = False
+            if self._closing:
+                return
+            if evt.error:
+                self._notify_error("写入剪贴板失败", evt.error)
+            elif evt.should_paste:
+                QTimer.singleShot(80, lambda: self._paste_to_previous_window(evt.target))
+            return
+
         if isinstance(evt, _PersistResult):
             if evt.stored is not None:
                 replaced = self.history.replace_first(evt.original, evt.stored)
@@ -279,8 +312,7 @@ class ClipHistApp:
                         self._notify_error("清理已删除记录失败", str(exc))
             if evt.error:
                 self._notify_error("持久化写入失败", evt.error)
-            if self.panel.isVisible():
-                self.panel.set_data(self.history.items(), self._get_favorites())
+            self._schedule_panel_refresh()
             return
 
         if isinstance(evt, _BlobResult):
@@ -288,6 +320,18 @@ class ClipHistApp:
             return
 
         if isinstance(evt, _AsyncResult):
+            if evt.operation == "优化数据库图片完成":
+                try:
+                    self._finish_compaction_success(max(0, int(evt.result or 0)))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    self._finish_compaction_error(str(exc))
+                return
+            if evt.operation == "优化数据库图片":
+                if evt.error:
+                    self._finish_compaction_error(evt.error)
+                else:
+                    self._handle_compaction_status(evt.result)
+                return
             if evt.error:
                 self._notify_error(evt.operation, evt.error)
             elif "收藏" in evt.operation:
@@ -327,8 +371,15 @@ class ClipHistApp:
                     future.add_done_callback(_persist_done)
                 except Exception as exc:
                     self._notify_error("持久化写入失败", str(exc))
-            if self.panel.isVisible():
-                self.panel.set_data(self.history.items(), self._get_favorites())
+            self._schedule_panel_refresh()
+
+    def _schedule_panel_refresh(self) -> None:
+        if self.panel.isVisible() and not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    def _refresh_panel(self) -> None:
+        if not self._closing and self.panel.isVisible():
+            self.panel.set_data(self.history.items(), self._get_favorites())
 
     def _activate_item(self, item: ClipboardItem, paste_override: bool | None = None) -> None:
         if item.needs_blob_load:
@@ -340,17 +391,28 @@ class ClipHistApp:
         self._finish_activation(item, paste_override)
 
     def _finish_activation(self, item: ClipboardItem, paste_override: bool | None) -> None:
-        try:
-            set_clipboard_item(item, hwnd=self.listener.hwnd)
-        except Exception as exc:
-            self._notify_error("写入剪贴板失败", str(exc))
+        if self._clipboard_write_pending or self._closing:
             return
         should_paste = self.settings.auto_paste if paste_override is None else paste_override
-        if should_paste:
-            QTimer.singleShot(80, self._paste_to_previous_window)
+        target = self._previous_foreground_hwnd
+        self._clipboard_write_pending = True
+        try:
+            future = self._clipboard_executor.submit(set_clipboard_item, item, hwnd=self.listener.hwnd)
 
-    def _paste_to_previous_window(self) -> None:
-        hwnd = self._previous_foreground_hwnd
+            def _written(done: Future) -> None:
+                try:
+                    done.result()
+                    result = _ClipboardWriteResult(should_paste, target)
+                except Exception as exc:
+                    result = _ClipboardWriteResult(should_paste, target, str(exc))
+                self._bridge.event.emit(result)
+
+            future.add_done_callback(_written)
+        except Exception as exc:
+            self._clipboard_write_pending = False
+            self._notify_error("写入剪贴板失败", str(exc))
+
+    def _paste_to_previous_window(self, hwnd: int | None) -> None:
         if not hwnd:
             return
         try:
@@ -389,10 +451,9 @@ class ClipHistApp:
                 except Exception:
                     pass
 
-    @staticmethod
-    def _blob_key(item: ClipboardItem) -> tuple | None:
+    def _blob_key(self, item: ClipboardItem) -> tuple | None:
         if item.db_id is not None:
-            return ("db", item.db_id)
+            return ("db", getattr(self, "_blob_generation", 0), item.db_id)
         if item._fingerprint:
             return ("fav", item._fingerprint)
         return None
@@ -416,6 +477,30 @@ class ClipHistApp:
             _, evicted = self._blob_cache.popitem(last=False)
             self._blob_cache_bytes -= len(evicted.raw_bytes or b"") + len(evicted.image_bytes or b"")
 
+    def _invalidate_blob_state(
+        self,
+        advance_generation: bool = True,
+        database_only: bool = False,
+    ) -> None:
+        """Drop loaded/pending blobs before the backing history changes."""
+        if database_only:
+            db_keys = [key for key in self._pending_blob_requests if key and key[0] == "db"]
+            for key in db_keys:
+                self._pending_blob_requests.pop(key, None)
+            self._blob_cache = OrderedDict(
+                (key, item) for key, item in self._blob_cache.items() if not key or key[0] != "db"
+            )
+            self._blob_cache_bytes = sum(
+                len(item.raw_bytes or b"") + len(item.image_bytes or b"")
+                for item in self._blob_cache.values()
+            )
+        else:
+            self._pending_blob_requests.clear()
+            self._blob_cache.clear()
+            self._blob_cache_bytes = 0
+        if advance_generation:
+            self._blob_generation = getattr(self, "_blob_generation", 0) + 1
+
     def _request_blob_load(self, item: ClipboardItem, purpose: str, paste_override: bool | None = None) -> None:
         key = self._blob_key(item)
         if key is None:
@@ -423,6 +508,8 @@ class ClipHistApp:
                 self._finish_activation(item, paste_override)
             return
         pending = self._pending_blob_requests.setdefault(key, [])
+        if (purpose, paste_override) in pending:
+            return
         pending.append((purpose, paste_override))
         if len(pending) > 1:
             return
@@ -456,38 +543,23 @@ class ClipHistApp:
 
     def _handle_blob_result(self, result: _BlobResult) -> None:
         requests = self._pending_blob_requests.pop(result.key, [])
+        if not requests or self._closing:
+            return
+        if not result.error and result.item.needs_blob_load:
+            result = replace(result, error="未找到完整的剪贴板内容")
         if not result.error:
             self._cache_blob(result.key, result.item)
         for purpose, paste_override in requests:
             if result.error:
-                if purpose == "activate":
+                if purpose in ("activate", "favorite"):
                     self._notify_error("加载剪贴板内容失败", result.error)
                 continue
             if purpose == "activate":
                 self._finish_activation(result.item, paste_override)
+            elif purpose == "favorite":
+                self._toggle_favorite(result.item)
             else:
                 self.panel.notify_blob_loaded()
-
-    def _ensure_blobs(self, item: ClipboardItem) -> ClipboardItem:
-        """Synchronous fallback for actions that must persist the full item."""
-        if not item.needs_blob_load:
-            return item
-        cached = self._cached_blob(item)
-        if cached is not None:
-            return cached
-        try:
-            if item.db_id is not None and self._store is not None:
-                raw, img = self._store.call("load_blobs", item.db_id)
-                loaded = item.with_blobs(raw, img)
-            else:
-                loaded = self.favorites.load_blobs(item)
-            key = self._blob_key(item)
-            if key is not None:
-                self._cache_blob(key, loaded)
-            return loaded
-        except Exception as exc:
-            self._notify_error("加载剪贴板内容失败", str(exc))
-            return item
 
     def _load_blobs_for_ui(self, item: ClipboardItem) -> ClipboardItem:
         """Return cached data immediately and schedule misses without blocking paint."""
@@ -529,8 +601,7 @@ class ClipHistApp:
         if not self._confirm_clear():
             return
         self.history.clear()
-        self._blob_cache.clear()
-        self._blob_cache_bytes = 0
+        self._invalidate_blob_state()
         if self._persistence_enabled and self._store is not None:
             try:
                 future = self._store.submit("clear")
@@ -548,6 +619,7 @@ class ClipHistApp:
         for item in items:
             key = self._blob_key(item)
             if key is not None:
+                self._pending_blob_requests.pop(key, None)
                 cached = self._blob_cache.pop(key, None)
                 if cached is not None:
                     self._blob_cache_bytes -= len(cached.raw_bytes or b"") + len(cached.image_bytes or b"")
@@ -566,6 +638,108 @@ class ClipHistApp:
         except Exception as exc:
             self._bridge.event.emit(_AsyncResult(operation, str(exc)))
 
+    def _compact_database(self) -> None:
+        if self._compaction_active:
+            return
+        if self._store is None:
+            self._notify_error("优化数据库图片", "请先启用持久化并创建数据库")
+            return
+        self._compaction_active = True
+        self._compaction_after_id = 0
+        self._compaction_saved_bytes = 0
+        self._sync_ui_state()
+        self._submit_compaction_batch()
+
+    def _submit_compaction_batch(self) -> None:
+        if not self._compaction_active or self._closing:
+            return
+        store = self._store
+        if store is None:
+            self._finish_compaction_error("数据库存储已关闭")
+            return
+        try:
+            future = store.submit("compact_images", self._compaction_after_id, 8)
+
+            def _compacted(done: Future, expected_store: AsyncSQLiteHistoryStore = store) -> None:
+                try:
+                    status = done.result()
+                    if self._store is not expected_store:
+                        raise RuntimeError("数据库存储已切换")
+                    self._bridge.event.emit(_AsyncResult("优化数据库图片", result=status))
+                except Exception as exc:
+                    self._bridge.event.emit(_AsyncResult("优化数据库图片", str(exc)))
+
+            future.add_done_callback(_compacted)
+        except Exception as exc:
+            self._finish_compaction_error(str(exc))
+
+    def _handle_compaction_status(self, status: object) -> None:
+        if not self._compaction_active:
+            return
+        if not isinstance(status, dict):
+            self._finish_compaction_error("数据库优化返回了无效状态")
+            return
+        try:
+            self._compaction_after_id = int(status["last_id"])
+            self._compaction_saved_bytes += max(0, int(status["saved_bytes"]))
+            done = bool(status["done"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            self._finish_compaction_error(f"数据库优化返回了无效状态：{exc}")
+            return
+        if not done:
+            self._submit_compaction_batch()
+            return
+
+        store = self._store
+        if store is None:
+            self._finish_compaction_error("数据库存储已关闭")
+            return
+        try:
+            future = store.submit("vacuum")
+
+            def _vacuumed(done_future: Future, expected_store: AsyncSQLiteHistoryStore = store) -> None:
+                try:
+                    done_future.result()
+                    if self._store is not expected_store:
+                        raise RuntimeError("数据库存储已切换")
+                    self._bridge.event.emit(
+                        _AsyncResult("优化数据库图片完成", result=self._compaction_saved_bytes)
+                    )
+                except Exception as exc:
+                    self._bridge.event.emit(_AsyncResult("优化数据库图片", str(exc)))
+
+            future.add_done_callback(_vacuumed)
+        except Exception as exc:
+            self._finish_compaction_error(str(exc))
+
+    def _finish_compaction_error(self, detail: str) -> None:
+        if not self._compaction_active:
+            return
+        self._compaction_active = False
+        self._sync_ui_state()
+        self._notify_error("优化数据库图片失败", detail)
+
+    def _finish_compaction_success(self, saved_bytes: int) -> None:
+        if not self._compaction_active:
+            return
+        self._compaction_active = False
+        self._sync_ui_state()
+        if saved_bytes >= 1024 * 1024:
+            saved_text = f"{saved_bytes / (1024 * 1024):.1f} MB"
+        elif saved_bytes >= 1024:
+            saved_text = f"{saved_bytes / 1024:.1f} KB"
+        else:
+            saved_text = f"{saved_bytes} bytes"
+        try:
+            self.tray.showMessage(
+                "ClipHist - 优化数据库图片",
+                f"无损优化完成，节省 {saved_text}。",
+                QSystemTrayIcon.Information,
+                5000,
+            )
+        except Exception:
+            log.debug("显示数据库优化结果异常", exc_info=True)
+
     def _confirm_clear(self) -> bool:
         parent = self.panel if self.panel.isVisible() else None
         reply = QMessageBox.question(
@@ -581,10 +755,12 @@ class ClipHistApp:
         return [(e.fav_id, e.item) for e in self.favorites.entries]
 
     def _toggle_favorite(self, item: ClipboardItem) -> tuple[bool, str | None]:
-        # Load blobs so that favorites are stored with full data
-        item = self._ensure_blobs(item)
         if item.needs_blob_load:
-            return False, "收藏内容加载失败，请稍后重试"
+            cached = self._cached_blob(item)
+            if cached is None:
+                self._request_blob_load(item, "favorite")
+                return True, None
+            item = cached
         self.favorites.toggle(item)
         self._save_favorites_async("保存收藏失败")
         return True, None
@@ -634,6 +810,7 @@ class ClipHistApp:
         target_path = os.path.abspath(new_db_path or default_db_path())
         if current_path == target_path:
             return True, None
+        self._invalidate_blob_state(database_only=True)
         try:
             self._store.close()
         except Exception:
@@ -691,6 +868,7 @@ class ClipHistApp:
                 os.makedirs(os.path.dirname(db_path), exist_ok=True)
                 candidate = AsyncSQLiteHistoryStore(db_path)
                 loaded = candidate.call("load_recent_slim", self.history.max_items)
+                self._invalidate_blob_state(database_only=True)
                 self._store = candidate
                 existing = self.history.items()
                 known = {item._fingerprint for item in loaded if item._fingerprint}
@@ -730,6 +908,10 @@ class ClipHistApp:
             self._act_persist.setChecked(self._persistence_enabled)
         except Exception:
             log.debug("更新托盘菜单异常", exc_info=True)
+        try:
+            self._act_compact.setEnabled(not self._compaction_active)
+        except Exception:
+            log.debug("更新数据库优化菜单异常", exc_info=True)
 
         self.panel.set_paused(self.paused)
 
@@ -854,6 +1036,9 @@ class ClipHistApp:
         panel_width = max(400, min(int(panel_width), 1600))
         panel_height = max(350, min(int(panel_height), 1200))
         new_db_path = (db_path or "").strip() or None
+        db_changed = new_db_path != self.settings.db_path
+        if db_changed and getattr(self, "_compaction_active", False):
+            return False, "数据库优化进行中，暂不能切换数据库位置"
 
         ok, warn = self._apply_hotkeys(show_seq, pause_seq, save=False)
         if not ok:
@@ -866,13 +1051,13 @@ class ClipHistApp:
                 log.exception("更新开机自启设置失败")
                 return False, "热键已更新，但开机自启设置失败"
 
-        db_changed = new_db_path != self.settings.db_path
         if db_changed and self._store is not None:
             if self._persistence_enabled:
                 ok_db, err_db = self._switch_db_path(new_db_path)
                 if not ok_db:
                     return False, err_db
             else:
+                self._invalidate_blob_state(database_only=True)
                 try:
                     self._store.close()
                 except Exception:
@@ -975,6 +1160,8 @@ class ClipHistApp:
         if self._closing:
             return
         self._closing = True
+        self._refresh_timer.stop()
+        self._clipboard_executor.shutdown(wait=True, cancel_futures=True)
         try:
             self.listener.stop()
         except Exception:

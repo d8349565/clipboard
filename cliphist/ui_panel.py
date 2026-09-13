@@ -3,11 +3,24 @@ from __future__ import annotations
 import os
 import re
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable
 
-from PySide6.QtCore import Qt, QMimeData, QTimer, QUrl, QRect, QPoint, QEvent
+from PySide6.QtCore import (
+    QObject,
+    QEvent,
+    QMimeData,
+    QPoint,
+    QRect,
+    QRunnable,
+    QThreadPool,
+    QTimer,
+    QUrl,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QColor, QCursor, QDrag, QGuiApplication, QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -414,26 +427,31 @@ class _ClipListWidget(QListWidget):
         # Load blobs on-demand for image drag
         if it.needs_blob_load and self._load_blobs is not None:
             it = self._load_blobs(it)
+            # The UI blob loader schedules a background read and returns the
+            # slim item on a cache miss.  Do not start a drag with an empty
+            # image payload; retry after the pending load has completed.
+            if it is None or it.needs_blob_load:
+                return
 
         mime = QMimeData()
+        image = None
         if it.item_type in ("text", "html", "rtf"):
             mime.setText(it.text or "")
         elif it.item_type == "files":
             urls = [QUrl.fromLocalFile(p) for p in (it.file_paths or ())]
             mime.setUrls(urls)
         elif it.item_type == "image":
-            img = _qimage_from_dib(it.raw_bytes or b"")
-            if img is not None and not img.isNull():
-                mime.setImageData(img)
+            image = _qimage_from_dib(it.raw_bytes or b"")
+            if image is None or image.isNull():
+                return
+            mime.setImageData(image)
         else:
             return
 
         drag = QDrag(self)
         drag.setMimeData(mime)
-        if it.item_type == "image":
-            img = _qimage_from_dib(it.raw_bytes or b"")
-            if img is not None and not img.isNull():
-                drag.setPixmap(QPixmap.fromImage(img).scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if image is not None:
+            drag.setPixmap(QPixmap.fromImage(image).scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         # File drags should always behave like copy to avoid moving source files.
         if it.item_type == "files":
             drag.exec(Qt.CopyAction)
@@ -466,6 +484,234 @@ def _qimage_from_dib(dib: bytes) -> QImage | None:
         return img
     except Exception:
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageDecodeRequest:
+    key: tuple
+    raw: bytes
+    width: int
+    height: int
+    dpr: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageDecodeResult:
+    key: tuple
+    image: QImage | None
+    dpr: float
+    error: str | None = None
+
+
+class _ImageDecodeSignals(QObject):
+    finished = Signal(object)
+
+
+class _ImageDecodeTask(QRunnable):
+    """Decode and scale one DIB away from the GUI thread."""
+
+    def __init__(self, request: _ImageDecodeRequest) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self.request = request
+        self.signals = _ImageDecodeSignals()
+
+    def run(self) -> None:  # type: ignore[override]
+        request = self.request
+        try:
+            image = _qimage_from_dib(request.raw)
+            if image is None or image.isNull():
+                raise ValueError("图片数据不可用")
+            image = image.scaled(
+                request.width,
+                request.height,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            if image.isNull():
+                raise ValueError("图片缩放失败")
+            image.setDevicePixelRatio(request.dpr)
+            result = _ImageDecodeResult(request.key, image, request.dpr)
+        except Exception as exc:
+            result = _ImageDecodeResult(request.key, None, request.dpr, str(exc))
+        self.signals.finished.emit(result)
+
+
+class _ImageDecodeQueue(QObject):
+    """Bounded image decode queue whose cache is owned by the UI thread."""
+
+    _MAX_ACTIVE = 2
+    _MAX_IN_FLIGHT = 32
+    _MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024
+    _MAX_CACHE_ENTRIES = 384
+    _MAX_CACHE_BYTES = 48 * 1024 * 1024
+    _MAX_FAILED_ENTRIES = 128
+
+    def __init__(
+        self,
+        on_ready: Callable[[tuple, QPixmap | None], None],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._on_ready = on_ready
+        self._pool = QThreadPool.globalInstance()
+        self._pending: OrderedDict[tuple, _ImageDecodeRequest] = OrderedDict()
+        self._active: dict[tuple, _ImageDecodeTask] = {}
+        self._inflight_bytes = 0
+        self._cache: OrderedDict[tuple, QPixmap] = OrderedDict()
+        self._cache_bytes = 0
+        self._failed: OrderedDict[tuple, None] = OrderedDict()
+        self._closed = False
+
+    @staticmethod
+    def make_key(source_key: tuple, kind: str, width: int, height: int, dpr: float) -> tuple:
+        return (
+            "image",
+            kind,
+            source_key,
+            max(1, int(width)),
+            max(1, int(height)),
+            round(max(1.0, float(dpr)), 3),
+        )
+
+    @staticmethod
+    def _pixmap_bytes(pixmap: QPixmap) -> int:
+        try:
+            value = int(pixmap.sizeInBytes())
+            if value > 0:
+                return value
+        except Exception:
+            pass
+        return max(1, pixmap.width() * pixmap.height() * 4)
+
+    def request(
+        self,
+        key: tuple,
+        raw: bytes,
+        width: int,
+        height: int,
+        dpr: float,
+    ) -> QPixmap | None:
+        """Return a cached pixmap or enqueue one without doing image work here."""
+        if self._closed or not raw:
+            return None
+
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
+        if key in self._failed or key in self._pending or key in self._active:
+            return None
+
+        # Keep the submitted work bounded. Old queued rows are less useful than
+        # the row the user is looking at now; running tasks are never cancelled.
+        raw_size = len(raw)
+        if raw_size > self._MAX_IN_FLIGHT_BYTES:
+            return None
+        while (
+            len(self._pending) + len(self._active) >= self._MAX_IN_FLIGHT
+            or self._inflight_bytes + raw_size > self._MAX_IN_FLIGHT_BYTES
+        ):
+            if not self._pending:
+                return None
+            _, dropped = self._pending.popitem(last=False)
+            self._inflight_bytes -= len(dropped.raw)
+
+        self._pending[key] = _ImageDecodeRequest(
+            key=key,
+            raw=raw,
+            width=max(1, int(width * max(1.0, float(dpr)))),
+            height=max(1, int(height * max(1.0, float(dpr)))),
+            dpr=max(1.0, float(dpr)),
+        )
+        self._inflight_bytes += raw_size
+        self._pump()
+        return None
+
+    def _pump(self) -> None:
+        if self._closed:
+            return
+        while len(self._active) < self._MAX_ACTIVE and self._pending:
+            key, request = self._pending.popitem(last=False)
+            task = _ImageDecodeTask(request)
+            task.signals.finished.connect(self._task_finished, Qt.QueuedConnection)
+            self._active[key] = task
+            try:
+                self._pool.start(task)
+            except Exception as exc:
+                self._active.pop(key, None)
+                self._inflight_bytes -= len(request.raw)
+                self._failed[key] = None
+                self._failed.move_to_end(key)
+                self._trim_failed()
+                try:
+                    self._on_ready(key, None)
+                except Exception:
+                    pass
+                # Continue pumping any remaining queued requests.
+                if exc:
+                    continue
+
+    def _trim_failed(self) -> None:
+        while len(self._failed) > self._MAX_FAILED_ENTRIES:
+            self._failed.popitem(last=False)
+
+    def _task_finished(self, result: _ImageDecodeResult) -> None:
+        key = result.key
+        task = self._active.pop(key, None)
+        if task is not None:
+            self._inflight_bytes -= len(task.request.raw)
+        if self._closed:
+            return
+
+        pixmap: QPixmap | None = None
+        if result.image is None or result.image.isNull():
+            self._failed[key] = None
+            self._failed.move_to_end(key)
+            self._trim_failed()
+        else:
+            try:
+                # This is deliberately the only QPixmap conversion in the
+                # worker pipeline, and this slot always runs in the UI thread.
+                pixmap = QPixmap.fromImage(result.image)
+                pixmap.setDevicePixelRatio(result.dpr)
+                if pixmap.isNull():
+                    pixmap = None
+            except Exception:
+                pixmap = None
+            if pixmap is None:
+                self._failed[key] = None
+                self._failed.move_to_end(key)
+                self._trim_failed()
+            else:
+                previous = self._cache.pop(key, None)
+                if previous is not None:
+                    self._cache_bytes -= self._pixmap_bytes(previous)
+                self._cache[key] = pixmap
+                self._cache_bytes += self._pixmap_bytes(pixmap)
+                while (
+                    len(self._cache) > self._MAX_CACHE_ENTRIES
+                    or self._cache_bytes > self._MAX_CACHE_BYTES
+                ) and len(self._cache) > 1:
+                    _, evicted = self._cache.popitem(last=False)
+                    self._cache_bytes -= self._pixmap_bytes(evicted)
+
+        try:
+            self._on_ready(key, pixmap)
+        except Exception:
+            # A panel can be closing while a queued completion is delivered.
+            pass
+        self._pump()
+
+    def close(self) -> None:
+        """Drop queued work and ignore completions from already running tasks."""
+        self._closed = True
+        self._inflight_bytes -= sum(len(request.raw) for request in self._pending.values())
+        self._pending.clear()
+        self._on_ready = lambda *_: None
+
+    def reopen(self) -> None:
+        self._closed = False
 
 
 def _html_fragment_from_clipboard(raw: bytes, max_len: int = 12000) -> str | None:
@@ -557,17 +803,20 @@ class _ClipItemDelegate(QStyledItemDelegate):
         "link": "链接",
     }
 
-    def __init__(self, parent: QWidget | None = None, load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None,
+        request_thumbnail: Callable[[ClipboardItem, int, float], QPixmap | None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._load_blobs = load_blobs
-        self._thumb_cache: dict[int, QPixmap] = {}
+        self._request_thumbnail = request_thumbnail
         self._preview_cache: dict[int, str] = {}
         self._secondary_cache: dict[int, str] = {}
 
     def clear_caches(self, keep_thumbnails: bool = False) -> None:
         """Clear text caches when items change."""
-        if not keep_thumbnails:
-            self._thumb_cache.clear()
         self._preview_cache.clear()
         self._secondary_cache.clear()
 
@@ -707,6 +956,9 @@ class _ClipItemDelegate(QStyledItemDelegate):
         return base.expandedTo(base.__class__(base.width(), 58))
 
     def _image_thumb(self, it: ClipboardItem, size: int) -> QPixmap | None:
+        if self._request_thumbnail is None:
+            return None
+
         # 按屏幕设备像素比渲染高清缩略图，避免在高 DPI 屏上被放大导致模糊。
         dpr = 1.0
         parent = self.parent()
@@ -717,32 +969,9 @@ class _ClipItemDelegate(QStyledItemDelegate):
                 dpr = 1.0
         if dpr < 1.0:
             dpr = 1.0
-        key = hash((self._cache_key(it), size, round(dpr, 3)))
-        cached = self._thumb_cache.get(key)
-        if cached is not None:
-            return cached
-        raw = it.raw_bytes
-        # 列表中的图片项通常为 slim 模式（raw_bytes 为空），按需从数据库加载一次用于生成缩略图。
-        if not raw and it.needs_blob_load and self._load_blobs is not None:
-            try:
-                loaded = self._load_blobs(it)
-                raw = loaded.raw_bytes
-            except Exception:
-                raw = None
-        if not raw:
-            return None
-        img = _qimage_from_dib(raw)
-        if img is None or img.isNull():
-            return None
-        target = max(1, int(round(size * dpr)))
-        pix = QPixmap.fromImage(img).scaled(
-            target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        pix.setDevicePixelRatio(dpr)
-        self._thumb_cache[key] = pix
-        if len(self._thumb_cache) > 260:
-            self._thumb_cache.pop(next(iter(self._thumb_cache)))
-        return pix
+        # Paint must stay allocation and decode free.  The panel callback only
+        # enqueues work and returns a cached pixmap when one is already ready.
+        return self._request_thumbnail(it, size, dpr)
 
     def _paint_icon_badge(
         self,
@@ -812,6 +1041,18 @@ class ClipPanel(QWidget):
         self._drag_pos: QPoint | None = None
         self._hover_preview = True
         self._active_category: str = "all"  # "all", "text", "image", "files", "link", "html", "rtf"
+        self._panel_closed = False
+        self._visual_blob_pending: set[tuple] = set()
+        self._visual_blob_waiting: set[tuple] = set()
+        self._visual_blob_cache: OrderedDict[tuple, ClipboardItem] = OrderedDict()
+        self._visual_blob_cache_bytes = 0
+        self._visual_blob_cache_limit = 16 * 1024 * 1024
+        self._image_decode = _ImageDecodeQueue(self._on_image_decode_ready, self)
+        self._preview_image: QPixmap | None = None
+        self._preview_image_key: tuple | None = None
+        self._popup_image_data: QPixmap | None = None
+        self._popup_image_key: tuple | None = None
+        self._popup_item: ClipboardItem | None = None
 
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -867,7 +1108,11 @@ class ClipPanel(QWidget):
         self._list_all = _ClipListWidget(self._get_filtered_item, card, load_blobs=self._load_blobs)
         self._list_all.setUniformItemSizes(True)
         self._list_all.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._delegate_all = _ClipItemDelegate(self._list_all, load_blobs=self._load_blobs)
+        self._delegate_all = _ClipItemDelegate(
+            self._list_all,
+            load_blobs=self._load_blobs,
+            request_thumbnail=self._request_thumbnail,
+        )
         self._list_all.setItemDelegate(self._delegate_all)
         self._list_all.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list_all.verticalScrollBar().setSingleStep(18)
@@ -882,7 +1127,11 @@ class ClipPanel(QWidget):
 
         self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card, load_blobs=self._load_blobs)
         self._list_fav.setUniformItemSizes(True)
-        self._delegate_fav = _ClipItemDelegate(self._list_fav, load_blobs=self._load_blobs)
+        self._delegate_fav = _ClipItemDelegate(
+            self._list_fav,
+            load_blobs=self._load_blobs,
+            request_thumbnail=self._request_thumbnail,
+        )
         self._list_fav.setItemDelegate(self._delegate_fav)
         self._list_fav.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self._list_fav.verticalScrollBar().setSingleStep(18)
@@ -973,7 +1222,6 @@ class ClipPanel(QWidget):
         preview_body.addLayout(preview_header)
         preview_body.addWidget(self._preview_stack)
         self._preview.setLayout(preview_body)
-        self._preview_image: QImage | None = None
 
         self._preview_popup = QFrame(self, Qt.ToolTip | Qt.FramelessWindowHint)
         self._preview_popup.setObjectName("previewPopup")
@@ -1009,12 +1257,16 @@ class ClipPanel(QWidget):
         popup_body.setSpacing(8)
         popup_body.addLayout(popup_header)
         popup_body.addWidget(self._popup_stack)
-        self._popup_image_data: QImage | None = None
+
+        self._preview_resize_timer = QTimer(self)
+        self._preview_resize_timer.setSingleShot(True)
+        self._preview_resize_timer.setInterval(80)
+        self._preview_resize_timer.timeout.connect(self._refresh_image_previews)
 
         # ── Row 1: Title bar ──
         title_bar = QHBoxLayout()
         title_bar.setSpacing(8)
-        self._title = QLabel("剪切板历史（吾爱破解）", card)
+        self._title = QLabel("剪切板历史管理", card)
         self._title.setObjectName("title")
         title_bar.addWidget(self._title)
 
@@ -1156,6 +1408,15 @@ class ClipPanel(QWidget):
         live_keys = {self._item_cache_key(item) for item in items}
         live_keys.update(self._item_cache_key(item) for _, item in favorites)
         self._search_cache = {key: value for key, value in self._search_cache.items() if key in live_keys}
+        self._visual_blob_waiting.intersection_update(live_keys)
+        self._visual_blob_pending.intersection_update(live_keys)
+        self._visual_blob_cache = OrderedDict(
+            (key, item) for key, item in self._visual_blob_cache.items() if key in live_keys
+        )
+        self._visual_blob_cache_bytes = sum(
+            len(item.raw_bytes or b"") + len(item.image_bytes or b"")
+            for item in self._visual_blob_cache.values()
+        )
         if self.isVisible():
             self._apply_filter()
 
@@ -1173,8 +1434,123 @@ class ClipPanel(QWidget):
             return ("fp", item._fingerprint)
         return ("obj", id(item))
 
+    def _is_live_item_key(self, key: tuple) -> bool:
+        return any(
+            self._item_cache_key(item) == key
+            for item in self._all_items
+        ) or any(
+            self._item_cache_key(item) == key
+            for _, item in self._favorites
+        )
+
+    def _cache_visual_blob(self, key: tuple, item: ClipboardItem) -> None:
+        previous = self._visual_blob_cache.pop(key, None)
+        if previous is not None:
+            self._visual_blob_cache_bytes -= len(previous.raw_bytes or b"") + len(previous.image_bytes or b"")
+        self._visual_blob_cache[key] = item
+        self._visual_blob_cache_bytes += len(item.raw_bytes or b"") + len(item.image_bytes or b"")
+        while self._visual_blob_cache_bytes > self._visual_blob_cache_limit and len(self._visual_blob_cache) > 1:
+            _, evicted = self._visual_blob_cache.popitem(last=False)
+            self._visual_blob_cache_bytes -= len(evicted.raw_bytes or b"") + len(evicted.image_bytes or b"")
+
+    def _schedule_visual_blob_load(self, item: ClipboardItem) -> None:
+        if self._panel_closed or self._load_blobs is None:
+            return
+        key = self._item_cache_key(item)
+        if key in self._visual_blob_pending or key in self._visual_blob_waiting:
+            return
+        self._visual_blob_pending.add(key)
+        QTimer.singleShot(0, lambda key=key, item=item: self._load_visual_blob(key, item))
+
+    def _load_visual_blob(self, key: tuple, item: ClipboardItem) -> None:
+        self._visual_blob_pending.discard(key)
+        if self._panel_closed or not self._is_live_item_key(key) or self._load_blobs is None:
+            return
+        try:
+            loaded = self._load_blobs(item)
+        except Exception:
+            loaded = item
+        if loaded is not None and not loaded.needs_blob_load and (
+            loaded.raw_bytes is not None or loaded.image_bytes is not None
+        ):
+            self._cache_visual_blob(key, loaded)
+        elif loaded is not None and loaded.needs_blob_load:
+            # The application loader has queued the DB read.  Wait for its
+            # notify_blob_loaded() callback before trying again.
+            self._visual_blob_waiting.add(key)
+        self.notify_blob_loaded()
+
+    def _request_thumbnail(self, item: ClipboardItem, size: int, dpr: float) -> QPixmap | None:
+        source_key = self._item_cache_key(item)
+        loaded = self._visual_blob_cache.get(source_key)
+        if loaded is not None:
+            self._visual_blob_cache.move_to_end(source_key)
+            item = loaded
+        raw = item.raw_bytes
+        if not raw:
+            if item.needs_blob_load:
+                self._schedule_visual_blob_load(item)
+            return None
+        key = _ImageDecodeQueue.make_key(source_key, "thumb", size, size, dpr)
+        return self._image_decode.request(key, raw, size, size, dpr)
+
+    @staticmethod
+    def _image_target_size(stack: QStackedWidget, docked: bool) -> tuple[int, int]:
+        width = int(stack.width())
+        height = int(stack.height())
+        if width <= 0:
+            width = 620 if not docked else 420
+        if height <= 0:
+            height = 350 if not docked else 140
+        # A preview never needs an unbounded source-sized pixmap.  The worker
+        # still decodes the source DIB, but the retained result stays small.
+        return min(width, 1600), min(height, 1200)
+
+    def _image_dpr(self, widget: QWidget) -> float:
+        try:
+            return max(1.0, float(widget.devicePixelRatioF()))
+        except Exception:
+            return 1.0
+
+    def _set_image_waiting(
+        self,
+        image_label: QLabel,
+        stack: QStackedWidget,
+        text: str,
+    ) -> None:
+        image_label.clear()
+        image_label.setText(text)
+        stack.setCurrentWidget(image_label)
+
+    def _on_image_decode_ready(self, key: tuple, pixmap: QPixmap | None) -> None:
+        if self._panel_closed:
+            return
+        self._list_all.viewport().update()
+        self._list_fav.viewport().update()
+
+        if key == self._preview_image_key:
+            self._preview_image = pixmap
+            if pixmap is None:
+                self._set_image_waiting(self._preview_image_label, self._preview_stack, "图片预览不可用")
+            else:
+                self._preview_image_label.clear()
+                self._preview_image_label.setPixmap(pixmap)
+                self._preview_stack.setCurrentWidget(self._preview_image_label)
+
+        if key == self._popup_image_key:
+            self._popup_image_data = pixmap
+            if pixmap is None:
+                self._set_image_waiting(self._popup_image, self._popup_stack, "图片预览不可用")
+            else:
+                self._popup_image.clear()
+                self._popup_image.setPixmap(pixmap)
+                self._popup_stack.setCurrentWidget(self._popup_image)
+
     def notify_blob_loaded(self) -> None:
         """Repaint placeholders after an asynchronous payload load completes."""
+        if self._panel_closed:
+            return
+        self._visual_blob_waiting.clear()
         self._list_all.viewport().update()
         self._list_fav.viewport().update()
         if not self._hover_preview:
@@ -1258,6 +1634,24 @@ class ClipPanel(QWidget):
         except Exception:
             pass
         self._render_popup_image()
+        preview_resize_timer = getattr(self, "_preview_resize_timer", None)
+        if preview_resize_timer is not None:
+            preview_resize_timer.start()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        self._panel_closed = False
+        self._image_decode.reopen()
+        super().showEvent(event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._panel_closed = True
+        self._filter_timer.stop()
+        self._preview_resize_timer.stop()
+        self._visual_blob_pending.clear()
+        self._visual_blob_waiting.clear()
+        self._image_decode.close()
+        self._preview_popup.hide()
+        super().closeEvent(event)
 
     def mousePressEvent(self, event):  # type: ignore[override]
         if event.button() == Qt.LeftButton:
@@ -1515,6 +1909,7 @@ class ClipPanel(QWidget):
             self._preview_meta.setText("")
             self._preview_stack.setCurrentWidget(self._preview_empty)
             self._preview_image = None
+            self._preview_image_key = None
             self._preview_image_label.clear()
             return
 
@@ -1533,22 +1928,41 @@ class ClipPanel(QWidget):
     def _render_preview_image(self) -> None:
         if self._preview_image is None:
             return
-        size = self._preview_stack.size()
-        if size.width() <= 0 or size.height() <= 0:
-            return
-        pix = QPixmap.fromImage(self._preview_image)
-        scaled = pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._preview_image_label.setPixmap(scaled)
+        self._preview_image_label.clear()
+        self._preview_image_label.setPixmap(self._preview_image)
+        self._preview_stack.setCurrentWidget(self._preview_image_label)
 
     def _render_popup_image(self) -> None:
         if self._popup_image_data is None:
             return
-        size = self._popup_stack.size()
-        if size.width() <= 0 or size.height() <= 0:
+        self._popup_image.clear()
+        self._popup_image.setPixmap(self._popup_image_data)
+        self._popup_stack.setCurrentWidget(self._popup_image)
+
+    def _refresh_image_previews(self) -> None:
+        """Request a size-appropriate image after a resize settles."""
+        if self._panel_closed:
             return
-        pix = QPixmap.fromImage(self._popup_image_data)
-        scaled = pix.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._popup_image.setPixmap(scaled)
+        if not self._hover_preview:
+            it = self._item_at_current_row()
+            if it is not None and it.item_type == "image":
+                self._render_preview_content(
+                    it,
+                    self._preview_meta,
+                    self._preview_text,
+                    self._preview_image_label,
+                    self._preview_stack,
+                    docked=True,
+                )
+        if self._preview_popup.isVisible() and self._popup_item is not None:
+            self._render_preview_content(
+                self._popup_item,
+                self._popup_meta,
+                self._popup_text,
+                self._popup_image,
+                self._popup_stack,
+                docked=False,
+            )
 
     def _render_preview_content(
         self,
@@ -1562,34 +1976,28 @@ class ClipPanel(QWidget):
         ts = it.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         meta_label.setText(f"{it.item_type.upper()} · {ts}")
 
-        # Load blobs on-demand for types that need them
-        if it.item_type in ("image", "html", "rtf") and it.needs_blob_load:
-            it = self._ensure_blobs(it)
+        source_key = self._item_cache_key(it)
+        loaded = self._visual_blob_cache.get(source_key)
+        if loaded is not None:
+            self._visual_blob_cache.move_to_end(source_key)
+            it = loaded
 
         if it.item_type == "image":
-            img = _qimage_from_dib(it.raw_bytes or b"")
-            if img is None or img.isNull():
-                text_widget.setPlainText("图片预览不可用")
-                stack.setCurrentWidget(text_widget)
-                if docked:
-                    self._preview_image = None
-                else:
-                    self._popup_image_data = None
-            else:
-                if docked:
-                    self._preview_image = img
-                    self._render_preview_image()
-                else:
-                    self._popup_image_data = img
-                    self._render_popup_image()
-                stack.setCurrentWidget(image_label)
+            self._render_image_preview(it, source_key, image_label, stack, docked)
             return
+
+        # Keep rich-text preview behavior unchanged; the application callback
+        # is non-blocking for lazy records and the retry arrives via notify.
+        if it.item_type in ("html", "rtf") and it.needs_blob_load:
+            it = self._ensure_blobs(it)
 
         if docked:
             self._preview_image = None
+            self._preview_image_key = None
             self._preview_image_label.clear()
         else:
             self._popup_image_data = None
+            self._popup_image_key = None
             self._popup_image.clear()
 
         if it.item_type == "html":
@@ -1620,6 +2028,56 @@ class ClipPanel(QWidget):
         text_widget.setPlainText(text)
         stack.setCurrentWidget(text_widget)
 
+    def _render_image_preview(
+        self,
+        it: ClipboardItem,
+        source_key: tuple,
+        image_label: QLabel,
+        stack: QStackedWidget,
+        docked: bool,
+    ) -> None:
+        if it.needs_blob_load:
+            self._schedule_visual_blob_load(it)
+            if docked:
+                self._preview_image = None
+                self._preview_image_key = None
+            else:
+                self._popup_image_data = None
+                self._popup_image_key = None
+            self._set_image_waiting(image_label, stack, "正在加载图片…")
+            return
+
+        raw = it.raw_bytes
+        if not raw:
+            if docked:
+                self._preview_image = None
+                self._preview_image_key = None
+            else:
+                self._popup_image_data = None
+                self._popup_image_key = None
+            self._set_image_waiting(image_label, stack, "图片预览不可用")
+            return
+
+        width, height = self._image_target_size(stack, docked)
+        dpr = self._image_dpr(stack)
+        kind = "preview" if docked else "popup"
+        key = _ImageDecodeQueue.make_key(source_key, kind, width, height, dpr)
+        if docked:
+            self._preview_image_key = key
+        else:
+            self._popup_image_key = key
+        pixmap = self._image_decode.request(key, raw, width, height, dpr)
+        if docked:
+            self._preview_image = pixmap
+        else:
+            self._popup_image_data = pixmap
+        if pixmap is None:
+            self._set_image_waiting(image_label, stack, "正在生成图片预览…")
+        else:
+            image_label.clear()
+            image_label.setPixmap(pixmap)
+            stack.setCurrentWidget(image_label)
+
     def _on_item_hover(self, widget: QListWidget, item: QListWidgetItem) -> None:
         if not self._hover_preview:
             return
@@ -1633,6 +2091,15 @@ class ClipPanel(QWidget):
         self._show_preview_popup(it, pos)
 
     def _show_preview_popup(self, it: ClipboardItem, pos: QPoint) -> None:
+        self._popup_item = it
+        if it.item_type == "image":
+            popup_w = min(640, max(420, self.width()))
+            popup_h = 420
+        else:
+            popup_w = min(520, max(360, self.width() - 40))
+            popup_h = 220
+        # Set the final geometry before requesting the worker target size.
+        self._preview_popup.resize(popup_w, popup_h)
         self._render_preview_content(
             it,
             self._popup_meta,
@@ -1641,13 +2108,6 @@ class ClipPanel(QWidget):
             self._popup_stack,
             docked=False,
         )
-        if it.item_type == "image":
-            popup_w = min(640, max(420, self.width()))
-            popup_h = 420
-        else:
-            popup_w = min(520, max(360, self.width() - 40))
-            popup_h = 220
-        self._preview_popup.resize(popup_w, popup_h)
         screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
         screen_geo = screen.availableGeometry()
         x = min(max(pos.x() + 16, screen_geo.left()), screen_geo.right() - popup_w)
@@ -1658,6 +2118,8 @@ class ClipPanel(QWidget):
     def _hide_preview_popup(self) -> None:
         if self._preview_popup.isVisible():
             self._preview_popup.hide()
+        self._popup_image_key = None
+        self._popup_item = None
 
     def _set_preview_mode(self, hover: bool) -> None:
         self._hover_preview = bool(hover)
