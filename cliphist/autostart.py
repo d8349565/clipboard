@@ -58,10 +58,15 @@ def _launch_command() -> tuple[str, str, str]:
         exe_path = Path(sys.executable).resolve()
         return str(exe_path), "", str(exe_path.parent)
 
-    python_executable = Path(sys.executable).resolve()
-    pythonw_executable = python_executable.with_name("pythonw.exe")
-    launcher = pythonw_executable if pythonw_executable.is_file() else python_executable
-
     project_root = Path(__file__).resolve().parent.parent
     run_py = project_root / "run.py"
+    # Prefer the project's environment so a shortcut keeps using the same
+    # dependencies even when the app was started from another Python on PATH.
+    project_python = project_root / ".venv" / "Scripts" / "pythonw.exe"
+    if project_python.is_file():
+        launcher = project_python.resolve()
+    else:
+        python_executable = Path(sys.executable).resolve()
+        pythonw_executable = python_executable.with_name("pythonw.exe")
+        launcher = pythonw_executable if pythonw_executable.is_file() else python_executable
     return str(launcher), f'"{run_py}"', str(project_root)

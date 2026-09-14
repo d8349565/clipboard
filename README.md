@@ -22,13 +22,34 @@ ClipHist 是一个 Windows 剪贴板历史管理工具，常驻系统托盘，�
 
 ### 方式一：直接运行源码
 
-```powershell
-# 安装依赖
-python -m pip install -r requirements.txt
+无需打包 EXE。在项目目录打开 PowerShell，首次使用时创建环境并安装依赖：
 
-# 启动程序
-python run.py
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+之后运行以下命令，或双击 `start_cliphist.bat`：
+
+```powershell
+.\start_cliphist.bat
+```
+
+脚本优先使用项目 `.venv` 中的 `pythonw.exe`，后台运行，不保留命令窗口。按 `Alt+C` 打开面板；退出请使用托盘菜单。
+
+开启源码版开机自启（当前用户登录 Windows 后运行，无需管理员权限）：
+
+```powershell
+.\enable_autostart.bat
+```
+
+该命令创建启动快捷方式，并立即启动程序。也可以在程序“设置”中勾选“开机自启”。关闭自启：
+
+```powershell
+.\enable_autostart.bat remove
+```
+
+自启依赖此项目目录和 Python 环境；移动项目后请重新开启自启。关闭自启不会退出已经运行的程序。
 
 ### 方式二：使用打包脚本生成 EXE
 
@@ -88,6 +109,8 @@ powershell -ExecutionPolicy Bypass -File build_windows.ps1 -Mode onedir
 | 运行日志     | `%APPDATA%\ClipHist\cliphist.log`                           |
 
 > 在设置中更改数据库位置后，已有历史会自动迁移到新位置。清空历史会自动回收数据库占用的磁盘空间。
+
+新写入的图片会自动使用无损压缩（压缩无收益时保留原始字节）。已有数据库可从托盘菜单手动执行“优化数据库图片”，按批次处理旧图片并在最后回收空间；最终回收可能短暂占用数据库工作线程。
 
 ## 常见问题
 

@@ -87,11 +87,13 @@ def _load_app():
         from cliphist.qt_app import ClipHistApp
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", "") or ""
-        if missing in ("win32con", "win32clipboard", "pythoncom", "PySide6"):
+        if missing.split(".")[0] in ("win32api", "win32gui", "win32con", "win32clipboard", "pythoncom", "win32com", "PySide6", "shiboken6"):
+            python_exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
+            requirements = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
             _msgbox(
                 f"依赖缺失：{missing}\n"
                 "请使用当前解释器安装依赖：\n"
-                f"  {sys.executable} -m pip install -r requirements.txt",
+                f'  & "{python_exe}" -m pip install -r "{requirements}"',
                 "ClipHist - 缺少依赖",
             )
         raise
