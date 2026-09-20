@@ -258,3 +258,36 @@ def test_repeated_preview_requests_share_one_decode(monkeypatch) -> None:
         panel.close()
         panel.deleteLater()
         app.processEvents()
+
+
+def test_thumbnail_survives_source_blob_cache_eviction(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+
+    def fake_decode(raw: bytes) -> QImage:
+        image = QImage(80, 60, QImage.Format_ARGB32)
+        image.fill(0xFF000000 | raw[0])
+        return image
+
+    monkeypatch.setattr("cliphist.ui_panel._qimage_from_dib", fake_decode)
+    panel = ClipPanel(on_activate=lambda *_: None)
+    panel._visual_blob_cache_limit = 150
+    first = ClipboardItem(ClipboardItem.now_utc(), "image", db_id=1, raw_size=100)
+    second = ClipboardItem(ClipboardItem.now_utc(), "image", db_id=2, raw_size=100)
+    try:
+        first_key = panel._item_cache_key(first)
+        panel._cache_visual_blob(first_key, first.with_blobs(b"\x11" * 100, None))
+        assert panel._request_thumbnail(first, 32, 1.0) is None
+        thumb_key = _ImageDecodeQueue.make_key(first_key, "thumb", 32, 32, 1.0)
+        _process_until(app, lambda: thumb_key in panel._image_decode._cache)
+
+        panel._cache_visual_blob(
+            panel._item_cache_key(second),
+            second.with_blobs(b"\x22" * 100, None),
+        )
+
+        assert first_key not in panel._visual_blob_cache
+        assert panel._request_thumbnail(first, 32, 1.0) is not None
+    finally:
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()

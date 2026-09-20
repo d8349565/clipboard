@@ -626,6 +626,13 @@ class _ImageDecodeQueue(QObject):
         self._pump()
         return None
 
+    def cached(self, key: tuple) -> QPixmap | None:
+        """Return a decoded image without requiring its source blob."""
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+        return cached
+
     def _pump(self) -> None:
         if self._closed:
             return
@@ -1492,6 +1499,10 @@ class ClipPanel(QWidget):
 
     def _request_thumbnail(self, item: ClipboardItem, size: int, dpr: float) -> QPixmap | None:
         source_key = self._item_cache_key(item)
+        key = _ImageDecodeQueue.make_key(source_key, "thumb", size, size, dpr)
+        cached = self._image_decode.cached(key)
+        if cached is not None:
+            return cached
         loaded = self._visual_blob_cache.get(source_key)
         if loaded is not None:
             self._visual_blob_cache.move_to_end(source_key)
@@ -1501,7 +1512,6 @@ class ClipPanel(QWidget):
             if item.needs_blob_load:
                 self._schedule_visual_blob_load(item)
             return None
-        key = _ImageDecodeQueue.make_key(source_key, "thumb", size, size, dpr)
         return self._image_decode.request(key, raw, size, size, dpr)
 
     @staticmethod
