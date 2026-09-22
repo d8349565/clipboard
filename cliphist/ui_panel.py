@@ -64,6 +64,8 @@ ROLE_IS_FAVORITE = int(Qt.UserRole + 2)
 ROLE_TITLE = int(Qt.UserRole + 3)
 ROLE_SUBTITLE = int(Qt.UserRole + 4)
 
+MIME_FAV_REORDER = "application/x-cliphist-fav-reorder"
+
 
 _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
     (
@@ -115,7 +117,7 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
             ("添加收藏", "在「全部」列表点击记录右侧星标；也可选中后按 Alt+F 或使用右键菜单。"),
             ("查看收藏", "点击「收藏」标签页，收藏内容持久保存，不受历史上限影响。"),
             ("批量管理", "收藏页支持 Ctrl / Shift 多选；点击「移出收藏」可一次处理多条内容。"),
-            ("调整顺序", "点击「置顶」将所选内容移到最前；右键「上移 / 下移」可精细调整。"),
+            ("调整顺序", "在「收藏」列表按住鼠标左键拖动记录，蓝色指示线位置松开即可排序；也可「置顶」或右键「上移 / 下移」。"),
             ("编辑文本", "对文本类收藏右键选择「编辑文本」，可直接修改内容后保存。"),
         ],
     ),
@@ -410,17 +412,78 @@ class HelpDialog(QDialog):
 
 class _ClipListWidget(QListWidget):
     def __init__(self, get_item: Callable[[int], ClipboardItem | None], parent: QWidget | None = None,
-                 load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None) -> None:
+                 load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None,
+                 on_reorder: Callable[[str, str, bool], None] | None = None) -> None:
         super().__init__(parent)
         self._get_item = get_item
         self._load_blobs = load_blobs
+        self._on_reorder = on_reorder
+        self._drop_line: QWidget | None = None
         self.setDragEnabled(True)
+        if on_reorder is not None:
+            self.setAcceptDrops(True)
+
+    def _reorder_id_at(self, row: int) -> str | None:
+        item = self.item(row)
+        if item is None:
+            return None
+        fav_id = item.data(ROLE_FAV_ID)
+        return fav_id if isinstance(fav_id, str) else None
+
+    def _reorder_anchor_at(self, pos: QPoint) -> tuple[str, bool, int] | None:
+        """Return (anchor fav id, insert after anchor, indicator y) for a drop at pos."""
+        item = self.itemAt(pos)
+        if item is None:
+            first = self.item(0)
+            last = self.item(self.count() - 1)
+            if first is None or last is None:
+                return None
+            first_rect = self.visualItemRect(first)
+            if pos.y() < first_rect.top():
+                item, after, y = first, False, first_rect.top()
+            else:
+                last_rect = self.visualItemRect(last)
+                item, after, y = last, True, last_rect.bottom() + 1
+        else:
+            rect = self.visualItemRect(item)
+            after = pos.y() >= rect.top() + rect.height() / 2
+            y = rect.bottom() + 1 if after else rect.top()
+        fav_id = item.data(ROLE_FAV_ID)
+        if not isinstance(fav_id, str):
+            return None
+        return fav_id, after, y
+
+    def _show_drop_line(self, y: int) -> None:
+        if self._drop_line is None:
+            line = QWidget(self.viewport())
+            line.setAttribute(Qt.WA_TransparentForMouseEvents)
+            line.setFixedHeight(2)
+            line.setStyleSheet("background: #2563EB;")
+            self._drop_line = line
+        self._drop_line.setGeometry(0, max(0, y - 1), self.viewport().width(), 2)
+        self._drop_line.show()
+        self._drop_line.raise_()
+
+    def _hide_drop_line(self) -> None:
+        if self._drop_line is not None:
+            self._drop_line.hide()
+
+    def _start_reorder_drag(self, reorder_id: str | None) -> None:
+        """Fallback drag carrying only the reorder marker when no payload can be built."""
+        if reorder_id is None:
+            return
+        mime = QMimeData()
+        mime.setData(MIME_FAV_REORDER, reorder_id.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.MoveAction | Qt.CopyAction)
 
     def startDrag(self, supportedActions):  # type: ignore[override]
         row = self.currentRow()
         it = self._get_item(row)
         if it is None:
             return
+        reorder_id = self._reorder_id_at(row)
 
         # Load blobs on-demand for image drag
         if it.needs_blob_load and self._load_blobs is not None:
@@ -429,32 +492,92 @@ class _ClipListWidget(QListWidget):
             # slim item on a cache miss.  Do not start a drag with an empty
             # image payload; retry after the pending load has completed.
             if it is None or it.needs_blob_load:
+                self._start_reorder_drag(reorder_id)
                 return
 
         mime = QMimeData()
         image = None
+        copy_only = False
         if it.item_type in ("text", "html", "rtf"):
             mime.setText(it.text or "")
         elif it.item_type == "files":
             urls = [QUrl.fromLocalFile(p) for p in (it.file_paths or ())]
             mime.setUrls(urls)
+            copy_only = True
         elif it.item_type == "image":
             image = _qimage_from_dib(it.raw_bytes or b"")
             if image is None or image.isNull():
+                self._start_reorder_drag(reorder_id)
                 return
             mime.setImageData(image)
         else:
+            self._start_reorder_drag(reorder_id)
             return
 
+        if reorder_id is not None:
+            mime.setData(MIME_FAV_REORDER, reorder_id.encode("utf-8"))
         drag = QDrag(self)
         drag.setMimeData(mime)
         if image is not None:
             drag.setPixmap(QPixmap.fromImage(image).scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         # File drags should always behave like copy to avoid moving source files.
-        if it.item_type == "files":
+        if copy_only:
             drag.exec(Qt.CopyAction)
         else:
             drag.exec(supportedActions)
+
+    def dragEnterEvent(self, event):  # type: ignore[override]
+        if self._on_reorder is not None and event.mimeData().hasFormat(MIME_FAV_REORDER):
+            if event.possibleActions() & Qt.MoveAction:
+                event.setDropAction(Qt.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):  # type: ignore[override]
+        if self._on_reorder is None or not event.mimeData().hasFormat(MIME_FAV_REORDER):
+            event.ignore()
+            return
+        pos = event.position().toPoint()
+        anchor = self._reorder_anchor_at(pos)
+        if anchor is None:
+            self._hide_drop_line()
+            event.ignore()
+            return
+        self._show_drop_line(anchor[2])
+        if event.possibleActions() & Qt.MoveAction:
+            event.setDropAction(Qt.MoveAction)
+        event.accept()
+        bar = self.verticalScrollBar()
+        if pos.y() < 20:
+            bar.setValue(bar.value() - 16)
+        elif pos.y() > self.viewport().height() - 20:
+            bar.setValue(bar.value() + 16)
+
+    def dragLeaveEvent(self, event):  # type: ignore[override]
+        self._hide_drop_line()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):  # type: ignore[override]
+        self._hide_drop_line()
+        if self._on_reorder is None or not event.mimeData().hasFormat(MIME_FAV_REORDER):
+            event.ignore()
+            return
+        anchor = self._reorder_anchor_at(event.position().toPoint())
+        if anchor is None:
+            event.ignore()
+            return
+        try:
+            src_id = bytes(event.mimeData().data(MIME_FAV_REORDER)).decode("utf-8")
+        except UnicodeDecodeError:
+            event.ignore()
+            return
+        anchor_id, after, _y = anchor
+        if event.possibleActions() & Qt.MoveAction:
+            event.setDropAction(Qt.MoveAction)
+        event.accept()
+        if anchor_id != src_id:
+            self._on_reorder(src_id, anchor_id, after)
 
 
 def _qimage_from_dib(dib: bytes) -> QImage | None:
@@ -1140,7 +1263,12 @@ class ClipPanel(QWidget):
         self._list_all.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self._list_all, pos))
         self._list_all.viewport().installEventFilter(self)
 
-        self._list_fav = _ClipListWidget(self._get_fav_filtered_item, card, load_blobs=self._load_blobs)
+        self._list_fav = _ClipListWidget(
+            self._get_fav_filtered_item,
+            card,
+            load_blobs=self._load_blobs,
+            on_reorder=self._on_fav_reorder_drop if self._reorder_favorites is not None else None,
+        )
         self._list_fav.setUniformItemSizes(True)
         self._list_fav.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._delegate_fav = _ClipItemDelegate(
@@ -2361,6 +2489,34 @@ class ClipPanel(QWidget):
         self._apply_filter()
         self._tabs.setCurrentIndex(1)
         self._list_fav.setCurrentRow(target % self._PAGE_SIZE)
+
+    def _on_fav_reorder_drop(self, src_id: str, anchor_id: str, after: bool) -> None:
+        if self._reorder_favorites is None:
+            return
+        full_ids = [fav_id for fav_id, _ in self._favorites]
+        if src_id not in full_ids or anchor_id not in full_ids or anchor_id == src_id:
+            return
+        rest = [fav_id for fav_id in full_ids if fav_id != src_id]
+        anchor_index = rest.index(anchor_id)
+        rest.insert(anchor_index + 1 if after else anchor_index, src_id)
+        if rest == full_ids:
+            return
+        ok, msg = self._reorder_favorites(rest)
+        if not ok:
+            QMessageBox.warning(self, "排序失败", msg or "收藏排序更新失败")
+            return
+        if self._get_favorites is not None:
+            try:
+                self._favorites = self._get_favorites()
+            except Exception:
+                pass
+        self._apply_filter()
+        for row_index, (fav_id, _) in enumerate(self._fav_filtered):
+            if fav_id == src_id:
+                self._fav_page = row_index // self._PAGE_SIZE
+                self._apply_filter()
+                self._list_fav.setCurrentRow(row_index % self._PAGE_SIZE)
+                break
 
     def _on_tab_changed(self) -> None:
         self._sync_tooltips()

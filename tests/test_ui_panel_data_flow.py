@@ -4,12 +4,14 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QItemSelectionModel, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QItemSelectionModel, QMimeData, QPointF, Qt
+from PySide6.QtGui import QDropEvent, QImage
 from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox
 
 from cliphist.models import ClipboardItem
 from cliphist.ui_panel import (
+    MIME_FAV_REORDER,
+    ROLE_FAV_ID,
     ROLE_ITEM,
     ClipPanel,
     _ClipListWidget,
@@ -132,6 +134,146 @@ def test_favorite_management_supports_batch_remove_and_move_to_top(monkeypatch) 
     finally:
         panel.close()
         panel.deleteLater()
+        app.processEvents()
+
+
+def test_favorite_list_drop_reorders_with_mouse_drag_mime() -> None:
+    app = QApplication.instance() or QApplication([])
+    items = [
+        ClipboardItem(datetime.now(timezone.utc), "text", text=f"favorite-{index}").prepared()
+        for index in range(4)
+    ]
+    state = [(f"fav-{index}", item) for index, item in enumerate(items)]
+    reordered_calls: list[list[str]] = []
+
+    def get_favorites():
+        return state[:]
+
+    def reorder_favorites(fav_ids: list[str]):
+        nonlocal state
+        reordered_calls.append(fav_ids[:])
+        lookup = dict(state)
+        state = [(fav_id, lookup[fav_id]) for fav_id in fav_ids]
+        return True, None
+
+    panel = ClipPanel(
+        on_activate=lambda *_: None,
+        get_favorites=get_favorites,
+        reorder_favorites=reorder_favorites,
+    )
+    try:
+        panel.resize(640, 620)
+        panel.set_data([], state)
+        panel._tabs.setCurrentIndex(1)
+        panel._apply_filter()
+        widget = panel._list_fav
+
+        def drop(marker: bytes | None, x: float, y: float) -> None:
+            mime = QMimeData()
+            if marker is not None:
+                mime.setData(MIME_FAV_REORDER, marker)
+            else:
+                mime.setText("outside")
+            event = QDropEvent(
+                QPointF(x, y),
+                Qt.MoveAction | Qt.CopyAction,
+                mime,
+                Qt.LeftButton,
+                Qt.NoModifier,
+            )
+            widget.dropEvent(event)
+
+        widget.doItemsLayout()
+        rect = widget.visualItemRect(widget.item(2))
+        assert rect.height() > 0
+
+        drop(b"fav-0", rect.left() + 8, rect.top() + rect.height() * 0.75)
+        assert reordered_calls == [["fav-1", "fav-2", "fav-0", "fav-3"]]
+        assert panel._list_fav.currentRow() == 2
+
+        widget.doItemsLayout()
+        rect = widget.visualItemRect(widget.item(0))
+        drop(b"fav-3", rect.left() + 8, rect.top() + rect.height() * 0.25)
+        assert reordered_calls[-1] == ["fav-3", "fav-1", "fav-2", "fav-0"]
+        assert panel._list_fav.currentRow() == 0
+
+        drop(None, rect.left() + 8, rect.top() + rect.height() * 0.25)
+        assert len(reordered_calls) == 2
+    finally:
+        panel.close()
+        panel.deleteLater()
+        app.processEvents()
+
+
+def test_fav_drag_carries_payload_and_reorder_marker(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    item = ClipboardItem(datetime.now(timezone.utc), "text", text="payload").prepared()
+    dragged: list[QMimeData] = []
+
+    class FakeDrag:
+        def __init__(self, *_args, **_kwargs):
+            self._mime: QMimeData | None = None
+
+        def setMimeData(self, mime: QMimeData) -> None:
+            self._mime = mime
+
+        def exec(self, _actions):
+            dragged.append(self._mime)
+            return Qt.IgnoreAction
+
+    widget = _ClipListWidget(lambda row: item if row == 0 else None, on_reorder=lambda *_: None)
+    row_item = QListWidgetItem()
+    row_item.setData(ROLE_ITEM, item)
+    row_item.setData(ROLE_FAV_ID, "fav-7")
+    widget.addItem(row_item)
+    widget.setCurrentRow(0)
+    monkeypatch.setattr("cliphist.ui_panel.QDrag", FakeDrag)
+    try:
+        widget.startDrag(Qt.CopyAction)
+        assert len(dragged) == 1
+        mime = dragged[0]
+        assert mime.text() == "payload"
+        assert bytes(mime.data(MIME_FAV_REORDER)) == b"fav-7"
+    finally:
+        widget.deleteLater()
+        app.processEvents()
+
+
+def test_fav_drag_without_payload_still_allows_reorder(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    item = ClipboardItem(datetime.now(timezone.utc), "image", db_id=9, raw_size=5)
+    dragged: list[QMimeData] = []
+
+    class FakeDrag:
+        def __init__(self, *_args, **_kwargs):
+            self._mime: QMimeData | None = None
+
+        def setMimeData(self, mime: QMimeData) -> None:
+            self._mime = mime
+
+        def exec(self, _actions):
+            dragged.append(self._mime)
+            return Qt.IgnoreAction
+
+    widget = _ClipListWidget(
+        lambda row: item if row == 0 else None,
+        load_blobs=lambda current: current,
+        on_reorder=lambda *_: None,
+    )
+    row_item = QListWidgetItem()
+    row_item.setData(ROLE_ITEM, item)
+    row_item.setData(ROLE_FAV_ID, "fav-8")
+    widget.addItem(row_item)
+    widget.setCurrentRow(0)
+    monkeypatch.setattr("cliphist.ui_panel.QDrag", FakeDrag)
+    try:
+        widget.startDrag(Qt.CopyAction)
+        assert len(dragged) == 1
+        mime = dragged[0]
+        assert bytes(mime.data(MIME_FAV_REORDER)) == b"fav-8"
+        assert not mime.hasText()
+    finally:
+        widget.deleteLater()
         app.processEvents()
 
 
