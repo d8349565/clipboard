@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import os
@@ -29,6 +29,7 @@ from .persistence import AsyncSQLiteHistoryStore
 from .settings import AppSettings, default_db_path, load_settings, save_settings
 from .set_clipboard import set_clipboard_item
 from .store import ClipboardHistory
+from .themes import apply_application_theme, normalize_theme
 from .ui_panel import ClipPanel
 from .ui_settings import SettingsDialog
 from .win_listener import ClipboardListener, HotkeyEvent
@@ -82,6 +83,10 @@ class ClipHistApp:
             log.debug("设置应用图标失败", exc_info=True)
 
         self.settings = load_settings()
+        self._theme_mode = self.settings.theme
+        self._settings_dialog: SettingsDialog | None = None
+        self.qt_app.setStyle("Fusion")
+        apply_application_theme(self.qt_app, self._theme_mode)
         actual_autostart = is_autostart_enabled()
         if actual_autostart != self.settings.autostart_enabled:
             self.settings = replace(self.settings, autostart_enabled=actual_autostart)
@@ -131,8 +136,12 @@ class ClipHistApp:
             edit_item=self._edit_item,
             delete_items=self._delete_history_items,
             load_blobs=self._load_blobs_for_ui,
+            on_toggle_pause=lambda: self._set_paused(not self.paused),
         )
+        self.panel.set_theme(self._theme_mode)
+        self.panel.set_auto_paste(self.settings.auto_paste)
         self.panel.resize(self.settings.panel_width, self.settings.panel_height)
+        self.qt_app.styleHints().colorSchemeChanged.connect(self._on_system_theme_changed)
         try:
             self.panel.setWindowIcon(self._app_icon)
         except Exception:
@@ -230,14 +239,39 @@ class ClipHistApp:
         self.panel.toggle_visible()
 
     def _open_settings(self) -> None:
+        if self._settings_dialog is not None:
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
+            return
+        saved_theme = self.settings.theme
         dlg = SettingsDialog(
             self.settings,
             self._apply_settings,
             backup_database=self._backup_database,
             database_summary=self._database_summary,
             parent=self.panel,
+            preview_theme=self._apply_theme,
         )
-        dlg.exec()
+        self._settings_dialog = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._settings_dialog = None
+            if dlg.result() != SettingsDialog.Accepted:
+                self.settings = replace(self.settings, theme=saved_theme)
+            self._apply_theme(self.settings.theme)
+            dlg.deleteLater()
+
+    def _apply_theme(self, mode: str) -> None:
+        self._theme_mode = normalize_theme(mode)
+        apply_application_theme(self.qt_app, self._theme_mode)
+        self.panel.set_theme(self._theme_mode)
+        if self._settings_dialog is not None:
+            self._settings_dialog._apply_styles()
+
+    def _on_system_theme_changed(self, *_args) -> None:
+        if self._theme_mode == "system":
+            self._apply_theme("system")
 
     def _database_summary(self, path: str) -> str:
         target = os.path.abspath(path or default_db_path())
@@ -1036,10 +1070,11 @@ class ClipHistApp:
         panel_width: int = 640,
         panel_height: int = 620,
         db_path: str = "",
+        theme: str | None = None,
     ) -> tuple[bool, str | None]:
         max_items = max(1, int(max_items))
         panel_width = max(400, min(int(panel_width), 1600))
-        panel_height = max(350, min(int(panel_height), 1200))
+        panel_height = max(440, min(int(panel_height), 1200))
         new_db_path = (db_path or "").strip() or None
         db_changed = new_db_path != self.settings.db_path
         if db_changed and getattr(self, "_compaction_active", False):
@@ -1100,7 +1135,10 @@ class ClipHistApp:
             panel_width=panel_width,
             panel_height=panel_height,
             db_path=new_db_path,
+            theme=normalize_theme(self.settings.theme if theme is None else theme),
         )
+        self._apply_theme(self.settings.theme)
+        self.panel.set_auto_paste(self.settings.auto_paste)
         try:
             save_settings(self.settings)
         except Exception:

@@ -31,3 +31,9 @@ dist/
 *.sqlite3
 *.db
 .claude/settings.local.json
+
+.pytest_tmp*/
+
+.release-work/
+
+.claude/

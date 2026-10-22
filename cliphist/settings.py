@@ -6,6 +6,7 @@ import os
 from dataclasses import asdict, dataclass
 
 from .autostart import is_autostart_enabled
+from .themes import normalize_theme
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class AppSettings:
     hotkey_toggle_pause: str = "Alt+P"
     panel_width: int = 640
     panel_height: int = 620
+    theme: str = "system"
 
 
 def default_app_dir() -> str:
@@ -60,7 +62,7 @@ def load_settings() -> AppSettings:
     panel_width = int(data.get("panel_width", 640))
     panel_height = int(data.get("panel_height", 620))
     panel_width = max(400, min(panel_width, 1600))
-    panel_height = max(350, min(panel_height, 1200))
+    panel_height = max(440, min(panel_height, 1200))
     return AppSettings(
         max_items=max_items,
         persist_enabled=persist_enabled,
@@ -71,6 +73,7 @@ def load_settings() -> AppSettings:
         hotkey_toggle_pause=hotkey_toggle_pause,
         panel_width=panel_width,
         panel_height=panel_height,
+        theme=normalize_theme(data.get("theme", "system")),
     )
 
 

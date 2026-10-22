@@ -66,6 +66,8 @@ if ($iconPath -and (Test-Path $iconPath)) {
     $pyinstallerArgs += @("--add-data", $iconData)
 }
 
+$pyinstallerArgs += @("--add-data", ((Join-Path $projectRoot "assets\ui") + ";assets/ui"))
+
 # PyInstaller's PySide6 hook discovers the required Qt plugins. Adding the
 # complete plugins directory here duplicated unused binaries and inflated the
 # portable executable.
@@ -114,7 +116,6 @@ $pyinstallerArgs += @(
     "--exclude-module", "PySide6.QtSerialPort",
     "--exclude-module", "PySide6.QtSql",
     "--exclude-module", "PySide6.QtStateMachine",
-    "--exclude-module", "PySide6.QtSvg",
     "--exclude-module", "PySide6.QtSvgWidgets",
     "--exclude-module", "PySide6.QtTest",
     "--exclude-module", "PySide6.QtTextToSpeech",
