@@ -5,11 +5,13 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
+from time import monotonic
 from typing import Callable
 
 from PySide6.QtCore import (
     QObject,
     QEvent,
+    QEventLoop,
     QItemSelectionModel,
     QMimeData,
     QPoint,
@@ -52,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .image_drag import ImageDragStore
 from .models import ClipboardItem
 from .ui_icons import type_icon
 from .themes import dialog_styles, theme_colors
@@ -113,7 +116,8 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
             ("Ctrl+F", "聚焦搜索框。"),
             ("Alt+F", "收藏 / 取消收藏当前选中的记录。"),
             ("Tab / Shift+Tab", "在最近记录与收藏之间切换；Ctrl+Tab 也可切换，F6 / Shift+F6 移动控件焦点。"),
-            ("空格", "列表获得焦点时，展开 / 收起选中内容预览。"),
+            ("空格", "列表获得焦点时，打开 / 关闭选中内容的小窗预览。"),
+            ("Ctrl+悬停", "按住 Ctrl 悬停在记录上临时预览，松开即关闭。"),
         ],
     ),
     (
@@ -129,8 +133,8 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
     (
         "👁", "预览功能",
         [
-            ("内容预览", "默认收起以留出列表空间；点击底部「预览」或列表中按空格展开，再次操作收起。"),
-            ("小窗口", "主动展开后使用浮动预览，鼠标经过记录不会自动弹出内容。"),
+            ("内容预览", "点击「预览」或列表中按空格打开小窗，不占用列表空间；可点击小窗右上角关闭。"),
+            ("临时预览", "Ctrl+悬停打开临时小窗，松开 Ctrl 或移开鼠标即关闭；普通悬停不弹出。"),
             ("图片预览", "图片类记录在列表中显示缩略图，预览区显示完整图片并随窗口自动缩放。"),
             ("富文本", "HTML / RTF 内容自动转换为纯文本预览，防止渲染异常。"),
         ],
@@ -149,7 +153,7 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
     (
         "💡", "实用技巧",
         [
-            ("拖拽使用", "直接把列表项拖拽到其他应用（文本→编辑器、图片→画图软件等）。"),
+            ("拖拽使用", "文本可拖到编辑器；图片可像 PNG 文件一样复制到文件夹或网页上传区，首次拖拽会短暂准备。"),
             ("移动窗口", "拖动面板顶部标题栏可移动窗口；右下角拖动手柄可调整大小。"),
             ("分页浏览", "历史记录过多时，列表底部显示分页控件，可快速跳转到上一页 / 下一页。"),
             ("清空历史", "在更多菜单中选择「清空历史」；收藏内容不受影响。"),
@@ -324,13 +328,27 @@ class HelpDialog(QDialog):
 
 
 class _ClipListWidget(QListWidget):
+    drag_status = Signal(str)
+
     def __init__(self, get_item: Callable[[int], ClipboardItem | None], parent: QWidget | None = None,
                  load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None,
-                 on_reorder: Callable[[str, str, bool], None] | None = None) -> None:
+                 on_reorder: Callable[[str, str, bool], None] | None = None,
+                 image_drag_store: ImageDragStore | None = None) -> None:
         super().__init__(parent)
         self._get_item = get_item
         self._load_blobs = load_blobs
         self._on_reorder = on_reorder
+        self._image_drag_store = image_drag_store or ImageDragStore(self)
+        self._pending_drag: tuple[ClipboardItem, object] | None = None
+        self._drag_retry = QTimer(self)
+        self._drag_retry.setInterval(40)
+        self._drag_retry.timeout.connect(self._check_image_drag)
+        self._image_drag_store.ready.connect(lambda _key: self._check_image_drag())
+        self._drag_wait_loop: QEventLoop | None = None
+        self._drag_starting = False
+        self._drag_result = None
+        self._drag_error = ""
+        self._drag_deadline = 0.0
         self._drop_line: QWidget | None = None
         self.setDragEnabled(True)
         if on_reorder is not None:
@@ -391,22 +409,86 @@ class _ClipListWidget(QListWidget):
         drag.setMimeData(mime)
         drag.exec(Qt.MoveAction | Qt.CopyAction)
 
+    def cancel_pending_drag(self) -> None:
+        self._pending_drag = None
+        self._drag_retry.stop()
+        if self._drag_wait_loop is not None:
+            self._drag_wait_loop.quit()
+        self.drag_status.emit("")
+
+    def _check_image_drag(self) -> None:
+        pending = self._pending_drag
+        if pending is None:
+            return
+        current = self._get_item(self.currentRow())
+        same_item = current is pending[0] or (current is not None and current._fingerprint and current._fingerprint == pending[0]._fingerprint)
+        if not (QApplication.mouseButtons() & Qt.LeftButton) or not same_item:
+            self.cancel_pending_drag()
+            return
+        if monotonic() >= self._drag_deadline:
+            self._drag_error = "图片准备较慢，请稍后重新拖拽"
+        else:
+            try:
+                loaded = self._load_blobs(current) if current.needs_blob_load and self._load_blobs else current
+                if loaded is None or loaded.needs_blob_load:
+                    return
+                self._drag_result = self._image_drag_store.request(loaded, _qimage_from_dib)
+            except (ValueError, OSError):
+                self._drag_error = "图片准备失败，请重新拖拽"
+        if self._drag_result is not None or self._drag_error:
+            if self._drag_wait_loop is not None:
+                self._drag_wait_loop.quit()
+
+    def _wait_for_image(self, item: ClipboardItem, actions):
+        self._pending_drag = (item, actions)
+        self._drag_result = None
+        self._drag_error = ""
+        self._drag_deadline = monotonic() + 10
+        loop = QEventLoop(self)
+        self._drag_wait_loop = loop
+        old_cursor = self.viewport().cursor()
+        try:
+            self._check_image_drag()
+            if self._pending_drag is not None and self._drag_result is None and not self._drag_error:
+                self.drag_status.emit("正在准备图片…")
+                self.viewport().setCursor(Qt.BusyCursor)
+                self._drag_retry.start()
+                # Keep this mouse gesture alive until exec(); worker completion,
+                # release, Escape and paint events still run in this local loop.
+                loop.exec()
+            return self._drag_result
+        finally:
+            self._drag_retry.stop()
+            self._drag_wait_loop = None
+            self._pending_drag = None
+            self.viewport().setCursor(old_cursor)
+            loop.deleteLater()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_wait_loop is not None:
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def startDrag(self, supportedActions):  # type: ignore[override]
+        if self._drag_starting:
+            return
+        self._drag_starting = True
+        self._drag_error = ""
+        try:
+            self._execute_drag(supportedActions)
+        finally:
+            self.cancel_pending_drag()
+            self._drag_starting = False
+            if self._drag_error:
+                self.drag_status.emit(self._drag_error)
+
+    def _execute_drag(self, supportedActions):
         row = self.currentRow()
         it = self._get_item(row)
         if it is None:
             return
         reorder_id = self._reorder_id_at(row)
-
-        # Load blobs on-demand for image drag
-        if it.needs_blob_load and self._load_blobs is not None:
-            it = self._load_blobs(it)
-            # The UI blob loader schedules a background read and returns the
-            # slim item on a cache miss.  Do not start a drag with an empty
-            # image payload; retry after the pending load has completed.
-            if it is None or it.needs_blob_load:
-                self._start_reorder_drag(reorder_id)
-                return
 
         mime = QMimeData()
         image = None
@@ -418,21 +500,26 @@ class _ClipListWidget(QListWidget):
             mime.setUrls(urls)
             copy_only = True
         elif it.item_type == "image":
-            image = _qimage_from_dib(it.raw_bytes or b"")
-            if image is None or image.isNull():
-                self._start_reorder_drag(reorder_id)
+            prepared = self._wait_for_image(it, supportedActions)
+            if prepared is None:
+                if self._drag_error:
+                    self.drag_status.emit(self._drag_error)
                 return
+            image = prepared.image
+            mime.setUrls([QUrl.fromLocalFile(str(prepared.path))])
             mime.setImageData(image)
+            copy_only = True
         else:
             self._start_reorder_drag(reorder_id)
             return
 
         if reorder_id is not None:
             mime.setData(MIME_FAV_REORDER, reorder_id.encode("utf-8"))
+        self.drag_status.emit("")
         drag = QDrag(self)
         drag.setMimeData(mime)
         if image is not None:
-            drag.setPixmap(QPixmap.fromImage(image).scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            drag.setPixmap(QPixmap.fromImage(prepared.thumbnail))
         # File drags should always behave like copy to avoid moving source files.
         if copy_only:
             drag.exec(Qt.CopyAction)
@@ -1009,7 +1096,8 @@ class ClipPanel(QWidget):
         self._fav_page = 0
         self._paused = False
         self._drag_pos: QPoint | None = None
-        self._hover_preview = True
+        self._preview_open = False
+        self._preview_hover = False
         self._active_category: str = "all"  # "all", "text", "image", "files", "link", "html", "rtf"
         self._panel_closed = False
         self._visual_blob_pending: set[tuple] = set()
@@ -1018,8 +1106,7 @@ class ClipPanel(QWidget):
         self._visual_blob_cache_bytes = 0
         self._visual_blob_cache_limit = 16 * 1024 * 1024
         self._image_decode = _ImageDecodeQueue(self._on_image_decode_ready, self)
-        self._preview_image: QPixmap | None = None
-        self._preview_image_key: tuple | None = None
+        self._image_drag_store = ImageDragStore(self)
         self._popup_image_data: QPixmap | None = None
         self._popup_image_key: tuple | None = None
         self._popup_item: ClipboardItem | None = None
@@ -1080,7 +1167,7 @@ class ClipPanel(QWidget):
             self._type_actions[key] = action
         self._btn_more_types.setMenu(type_menu)
 
-        self._list_all = _ClipListWidget(self._get_filtered_item, card, load_blobs=self._load_blobs)
+        self._list_all = _ClipListWidget(self._get_filtered_item, card, load_blobs=self._load_blobs, image_drag_store=self._image_drag_store)
         self._list_all.setUniformItemSizes(True)
         self._list_all.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._delegate_all = _ClipItemDelegate(
@@ -1107,6 +1194,7 @@ class ClipPanel(QWidget):
             card,
             load_blobs=self._load_blobs,
             on_reorder=self._on_fav_reorder_drop if self._reorder_favorites is not None else None,
+            image_drag_store=self._image_drag_store,
         )
         self._list_fav.setUniformItemSizes(True)
         self._list_fav.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -1169,55 +1257,7 @@ class ClipPanel(QWidget):
         self._btn_next_page.clicked.connect(lambda: self._change_page(1))
         pager.addWidget(self._btn_next_page)
 
-        self._preview = QFrame(card)
-        self._preview.setObjectName("previewCard")
-        self._preview.setMinimumHeight(104)
-        self._preview.setMaximumHeight(176)
-
-        preview_header = QHBoxLayout()
-        self._preview_title = QLabel("内容预览", self._preview)
-        self._preview_title.setObjectName("previewTitle")
-        preview_header.addWidget(self._preview_title)
-        preview_header.addStretch(1)
-        self._preview_meta = QLabel("", self._preview)
-        self._preview_meta.setObjectName("previewMeta")
-        preview_header.addWidget(self._preview_meta)
-        self._btn_collapse_preview = QToolButton(self._preview)
-        self._btn_collapse_preview.setText("收起")
-        self._btn_collapse_preview.setObjectName("btnText")
-        self._btn_collapse_preview.setToolTip("收起内容预览，仍可通过预览按钮展开")
-        self._btn_collapse_preview.clicked.connect(lambda: self._set_preview_mode(True))
-        preview_header.addWidget(self._btn_collapse_preview)
-
-        self._preview_stack = QStackedWidget(self._preview)
-        self._preview_empty = QLabel("选择一条记录以预览内容", self._preview)
-        self._preview_empty.setAlignment(Qt.AlignCenter)
-        self._preview_empty.setObjectName("previewEmpty")
-
-        self._preview_text = QTextBrowser(self._preview)
-        self._preview_text.setOpenExternalLinks(False)
-        self._preview_text.setReadOnly(True)
-        self._preview_text.setTabChangesFocus(True)
-        self._preview_text.setFrameStyle(QFrame.NoFrame)
-        self._preview_text.setObjectName("previewText")
-
-        self._preview_image_label = QLabel(self._preview)
-        self._preview_image_label.setAlignment(Qt.AlignCenter)
-        self._preview_image_label.setObjectName("previewImage")
-
-        self._preview_stack.addWidget(self._preview_empty)
-        self._preview_stack.addWidget(self._preview_text)
-        self._preview_stack.addWidget(self._preview_image_label)
-        self._preview_stack.setCurrentWidget(self._preview_empty)
-
-        preview_body = QVBoxLayout(self._preview)
-        preview_body.setContentsMargins(10, 10, 10, 10)
-        preview_body.setSpacing(8)
-        preview_body.addLayout(preview_header)
-        preview_body.addWidget(self._preview_stack)
-        self._preview.setLayout(preview_body)
-
-        self._preview_popup = QFrame(self, Qt.ToolTip | Qt.FramelessWindowHint)
+        self._preview_popup = QFrame(self, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
         self._preview_popup.setObjectName("previewPopup")
         self._preview_popup.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self._preview_popup.setAttribute(Qt.WA_TranslucentBackground, False)
@@ -1230,6 +1270,15 @@ class ClipPanel(QWidget):
         popup_header.addWidget(self._popup_title)
         popup_header.addStretch(1)
         popup_header.addWidget(self._popup_meta)
+        self._popup_close = QToolButton(self._preview_popup)
+        self._popup_close.setObjectName("btnWinClose")
+        self._popup_close.setText("×")
+        self._popup_close.setToolTip("关闭预览")
+        self._popup_close.setAccessibleName("关闭预览")
+        self._popup_close.setFocusPolicy(Qt.NoFocus)
+        self._popup_close.setFixedSize(28, 28)
+        self._popup_close.clicked.connect(self._close_preview)
+        popup_header.addWidget(self._popup_close)
         self._popup_stack = QStackedWidget(self._preview_popup)
         self._popup_empty = QLabel("暂无预览", self._preview_popup)
         self._popup_empty.setAlignment(Qt.AlignCenter)
@@ -1351,6 +1400,8 @@ class ClipPanel(QWidget):
         footer.setSpacing(8)
         self._keyboard_hint = QLabel("Tab 切换  ·  ↑↓ 选择", card)
         self._keyboard_hint.setObjectName("keyboardHint")
+        for widget in (self._list_all, self._list_fav):
+            widget.drag_status.connect(lambda message: self._keyboard_hint.setText(message or "Tab 切换  ·  ↑↓ 选择"))
         footer.addWidget(self._keyboard_hint)
         footer.addStretch(1)
         self._btn_preview_mode = QToolButton(card)
@@ -1376,7 +1427,6 @@ class ClipPanel(QWidget):
         body.addWidget(self._tabs, 1)
         body.addWidget(self._empty_state)
         body.addLayout(pager)
-        body.addWidget(self._preview)
         body.addLayout(footer)
 
         root = QVBoxLayout(self)
@@ -1390,7 +1440,8 @@ class ClipPanel(QWidget):
         self._grip.raise_()
         self._apply_styles()
         self._sync_status()
-        self._set_preview_mode(True)
+        self._btn_preview_mode.setText("预览")
+        self._btn_preview_mode.setToolTip("空格切换小窗预览；Ctrl+悬停临时预览")
         self._sync_tooltips()
         QApplication.instance().installEventFilter(self)
 
@@ -1529,15 +1580,6 @@ class ClipPanel(QWidget):
         self._list_all.viewport().update()
         self._list_fav.viewport().update()
 
-        if key == self._preview_image_key:
-            self._preview_image = pixmap
-            if pixmap is None:
-                self._set_image_waiting(self._preview_image_label, self._preview_stack, "图片预览不可用")
-            else:
-                self._preview_image_label.clear()
-                self._preview_image_label.setPixmap(pixmap)
-                self._preview_stack.setCurrentWidget(self._preview_image_label)
-
         if key == self._popup_image_key:
             self._popup_image_data = pixmap
             if pixmap is None:
@@ -1554,10 +1596,10 @@ class ClipPanel(QWidget):
         self._visual_blob_waiting.clear()
         self._list_all.viewport().update()
         self._list_fav.viewport().update()
-        if not self._hover_preview:
+        if self._preview_open:
             self._update_preview()
         elif self._preview_popup.isVisible() and self._popup_item is not None:
-            self._show_preview_popup(self._popup_item, self._btn_preview_mode.mapToGlobal(QPoint(0, 0)))
+            self._show_preview_popup(self._popup_item)
 
     def _ensure_blobs(self, it: ClipboardItem) -> ClipboardItem:
         """Load blob data on-demand from the DB via the callback."""
@@ -1624,7 +1666,6 @@ class ClipPanel(QWidget):
 
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
-        self._render_preview_image()
         try:
             grip_size = self._grip.sizeHint()
             # root layout has 10px margins for drop shadow; align grip with card corner
@@ -1639,10 +1680,8 @@ class ClipPanel(QWidget):
         if hasattr(self, "_body_layout"):
             self._body_layout.setSpacing(4 if self.height() < 500 else 8)
             self._keyboard_hint.setVisible(self.width() >= 500)
-            if (event.oldSize().height() < 500) != (self.height() < 500):
-                self._hide_preview_popup()
-            self._btn_preview_mode.setText("预览内容" if self.height() < 500 else "预览" if self._hover_preview else "收起预览")
-            self._preview.setVisible(not self._hover_preview and self.height() >= 500 and self._item_at_current_row() is not None)
+            if self._preview_popup.isVisible() and self._popup_item is not None:
+                self._position_preview_popup()
         preview_resize_timer = getattr(self, "_preview_resize_timer", None)
         if preview_resize_timer is not None:
             preview_resize_timer.start()
@@ -1653,7 +1692,9 @@ class ClipPanel(QWidget):
         super().showEvent(event)
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
-        self._hide_preview_popup()
+        for widget in (self._list_all, self._list_fav):
+            widget.cancel_pending_drag()
+        self._close_preview()
         super().hideEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -1718,6 +1759,26 @@ class ClipPanel(QWidget):
             key = event.key()
             content_focus = obj in (self._search, self._list_all, self._list_fav, self._list_all.viewport(), self._list_fav.viewport())
             main_focus = self._panel_has_focus() and QApplication.focusWidget().window() is self
+            modifiers = event.modifiers()
+            if main_focus and key == Qt.Key_F and modifiers & Qt.ControlModifier and not modifiers & (Qt.AltModifier | Qt.MetaModifier):
+                self._search.setFocus()
+                self._search.selectAll()
+                return True
+            if main_focus and key == Qt.Key_F and modifiers == Qt.AltModifier:
+                self._toggle_current_favorite()
+                return True
+            if main_focus and key == Qt.Key_Escape:
+                self.hide()
+                return True
+            if main_focus and content_focus and obj is not self._search and key == Qt.Key_Delete and modifiers == Qt.NoModifier:
+                if self._tabs.currentIndex() == 1:
+                    self._remove_selected_favorites()
+                else:
+                    self._delete_selected_history()
+                return True
+            if main_focus and key == Qt.Key_Control and not self._preview_open:
+                widget = self._current_list()
+                self._preview_at_position(widget, widget.viewport().mapFromGlobal(QCursor.pos()))
             if main_focus and key in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
                 self._activate_current(paste_override=False)
                 return True
@@ -1751,6 +1812,15 @@ class ClipPanel(QWidget):
                 self._cycle_tabs(-1 if backwards else 1)
                 return True
 
+        if event.type() in (QEvent.Type.MouseMove, QEvent.Type.Leave):
+            for widget in (self._list_all, self._list_fav):
+                if obj is widget.viewport():
+                    if event.type() == QEvent.Type.MouseMove and event.modifiers() & Qt.ControlModifier:
+                        self._preview_at_position(widget, event.position().toPoint())
+                    elif self._preview_hover:
+                        self._hide_preview_popup()
+        if event.type() == QEvent.Type.KeyRelease and event.key() == Qt.Key_Control and self._preview_hover:
+            self._hide_preview_popup()
         return super().eventFilter(obj, event)
 
     def _panel_has_focus(self) -> bool:
@@ -1974,41 +2044,13 @@ class ClipPanel(QWidget):
         self._refresh_lists(preserve_selection=not (changed or reset_selection))
 
     def _update_preview(self) -> None:
-        it = self._item_at_current_row()
-        if not self._hover_preview and self.height() < 500 and self._preview_popup.isVisible():
-            if it is None:
-                self._hide_preview_popup()
-            else:
-                self._show_preview_popup(it, self._btn_preview_mode.mapToGlobal(QPoint(0, 0)))
+        if not self._preview_open:
             return
-        if self._hover_preview:
-            return
-        if it is None:
-            self._preview_meta.setText("")
-            self._preview_stack.setCurrentWidget(self._preview_empty)
-            self._preview_image = None
-            self._preview_image_key = None
-            self._preview_image_label.clear()
-            return
-
-        ts = it.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        self._preview_meta.setText(f"{it.item_type.upper()} · {ts}")
-
-        self._render_preview_content(
-            it,
-            self._preview_meta,
-            self._preview_text,
-            self._preview_image_label,
-            self._preview_stack,
-            docked=True,
-        )
-
-    def _render_preview_image(self) -> None:
-        if self._preview_image is None:
-            return
-        self._preview_image_label.clear()
-        self._preview_image_label.setPixmap(self._preview_image)
-        self._preview_stack.setCurrentWidget(self._preview_image_label)
+        item = self._item_at_current_row()
+        if item is None:
+            self._hide_preview_popup()
+        else:
+            self._show_preview_popup(item)
 
     def _render_popup_image(self) -> None:
         if self._popup_image_data is None:
@@ -2021,17 +2063,6 @@ class ClipPanel(QWidget):
         """Request a size-appropriate image after a resize settles."""
         if self._panel_closed:
             return
-        if not self._hover_preview:
-            it = self._item_at_current_row()
-            if it is not None and it.item_type == "image":
-                self._render_preview_content(
-                    it,
-                    self._preview_meta,
-                    self._preview_text,
-                    self._preview_image_label,
-                    self._preview_stack,
-                    docked=True,
-                )
         if self._preview_popup.isVisible() and self._popup_item is not None:
             self._render_preview_content(
                 self._popup_item,
@@ -2039,8 +2070,7 @@ class ClipPanel(QWidget):
                 self._popup_text,
                 self._popup_image,
                 self._popup_stack,
-                docked=False,
-            )
+                )
 
     def _render_preview_content(
         self,
@@ -2049,7 +2079,6 @@ class ClipPanel(QWidget):
         text_widget: QTextBrowser,
         image_label: QLabel,
         stack: QStackedWidget,
-        docked: bool,
     ) -> None:
         ts = it.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         meta_label.setText(f"{it.item_type.upper()} · {ts}")
@@ -2061,7 +2090,7 @@ class ClipPanel(QWidget):
             it = loaded
 
         if it.item_type == "image":
-            self._render_image_preview(it, source_key, image_label, stack, docked)
+            self._render_image_preview(it, source_key, image_label, stack)
             return
 
         # Keep rich-text preview behavior unchanged; the application callback
@@ -2069,14 +2098,9 @@ class ClipPanel(QWidget):
         if it.item_type in ("html", "rtf") and it.needs_blob_load:
             it = self._ensure_blobs(it)
 
-        if docked:
-            self._preview_image = None
-            self._preview_image_key = None
-            self._preview_image_label.clear()
-        else:
-            self._popup_image_data = None
-            self._popup_image_key = None
-            self._popup_image.clear()
+        self._popup_image_data = None
+        self._popup_image_key = None
+        self._popup_image.clear()
 
         if it.item_type == "html":
             html = _html_fragment_from_clipboard(it.raw_bytes or b"")
@@ -2106,49 +2130,23 @@ class ClipPanel(QWidget):
         text_widget.setPlainText(text)
         stack.setCurrentWidget(text_widget)
 
-    def _render_image_preview(
-        self,
-        it: ClipboardItem,
-        source_key: tuple,
-        image_label: QLabel,
-        stack: QStackedWidget,
-        docked: bool,
-    ) -> None:
+    def _render_image_preview(self, it: ClipboardItem, source_key: tuple, image_label: QLabel, stack: QStackedWidget) -> None:
         if it.needs_blob_load:
             self._schedule_visual_blob_load(it)
-            if docked:
-                self._preview_image = None
-                self._preview_image_key = None
-            else:
-                self._popup_image_data = None
-                self._popup_image_key = None
+            self._popup_image_data = None
+            self._popup_image_key = None
             self._set_image_waiting(image_label, stack, "正在加载图片…")
             return
-
-        raw = it.raw_bytes
-        if not raw:
-            if docked:
-                self._preview_image = None
-                self._preview_image_key = None
-            else:
-                self._popup_image_data = None
-                self._popup_image_key = None
+        if not it.raw_bytes:
+            self._popup_image_data = None
+            self._popup_image_key = None
             self._set_image_waiting(image_label, stack, "图片预览不可用")
             return
-
-        width, height = self._image_target_size(stack, docked)
-        dpr = self._image_dpr(stack)
-        kind = "preview" if docked else "popup"
-        key = _ImageDecodeQueue.make_key(source_key, kind, width, height, dpr)
-        if docked:
-            self._preview_image_key = key
-        else:
-            self._popup_image_key = key
-        pixmap = self._image_decode.request(key, raw, width, height, dpr)
-        if docked:
-            self._preview_image = pixmap
-        else:
-            self._popup_image_data = pixmap
+        width, height = self._image_target_size(stack, False)
+        key = _ImageDecodeQueue.make_key(source_key, "popup", width, height, self._image_dpr(stack))
+        self._popup_image_key = key
+        pixmap = self._image_decode.request(key, it.raw_bytes, width, height, self._image_dpr(stack))
+        self._popup_image_data = pixmap
         if pixmap is None:
             self._set_image_waiting(image_label, stack, "正在生成图片预览…")
         else:
@@ -2156,54 +2154,66 @@ class ClipPanel(QWidget):
             image_label.setPixmap(pixmap)
             stack.setCurrentWidget(image_label)
 
-    def _show_preview_popup(self, it: ClipboardItem, pos: QPoint) -> None:
-        self._popup_item = it
-        if it.item_type == "image":
-            popup_w = min(640, max(420, self.width()))
-            popup_h = 420
+    def _position_preview_popup(self) -> None:
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        width, height = self._preview_popup.width(), self._preview_popup.height()
+        geometry = self.frameGeometry()
+        if geometry.right() + 12 + width <= area.right() + 1:
+            x, y = geometry.right() + 12, geometry.top()
+        elif geometry.left() - 12 - width >= area.left():
+            x, y = geometry.left() - 12 - width, geometry.top()
+        elif geometry.bottom() + 12 + height <= area.bottom() + 1:
+            x, y = geometry.left(), geometry.bottom() + 12
         else:
-            popup_w = min(520, max(360, self.width() - 40))
-            popup_h = 220
-        # Set the final geometry before requesting the worker target size.
-        self._preview_popup.resize(popup_w, popup_h)
-        self._render_preview_content(
-            it,
-            self._popup_meta,
-            self._popup_text,
-            self._popup_image,
-            self._popup_stack,
-            docked=False,
-        )
-        screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
-        screen_geo = screen.availableGeometry()
-        x = min(max(pos.x() + 16, screen_geo.left()), screen_geo.right() - popup_w)
-        y = min(max(pos.y() + 16, screen_geo.top()), screen_geo.bottom() - popup_h)
+            x, y = geometry.left(), geometry.top() - height - 12
+        x = max(area.left(), min(x, area.right() + 1 - width))
+        y = max(area.top(), min(y, area.bottom() + 1 - height))
         self._preview_popup.move(x, y)
+
+    def _show_preview_popup(self, item: ClipboardItem) -> None:
+        self._popup_item = item
+        area = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        width = min(520 if item.item_type == "image" else 440, area.width())
+        height = min(380 if item.item_type == "image" else 260, area.height())
+        self._preview_popup.resize(width, height)
+        self._render_preview_content(item, self._popup_meta, self._popup_text, self._popup_image, self._popup_stack)
+        self._position_preview_popup()
         self._preview_popup.show()
 
     def _hide_preview_popup(self) -> None:
-        if self._preview_popup.isVisible():
-            self._preview_popup.hide()
+        self._preview_popup.hide()
         self._popup_image_key = None
         self._popup_item = None
+        self._preview_hover = False
 
-    def _set_preview_mode(self, hover: bool) -> None:
-        self._hover_preview = bool(hover)
+    def _close_preview(self) -> None:
+        self._preview_open = False
         self._hide_preview_popup()
-        current = self._item_at_current_row()
-        compact = self.height() < 500
-        if not hover and compact and current is not None:
-            self._show_preview_popup(current, self._btn_preview_mode.mapToGlobal(QPoint(0, 0)))
-        self._btn_preview_mode.setText("预览" if hover else "关闭预览" if compact else "收起预览")
-        self._btn_preview_mode.setToolTip("列表中按空格或点击切换预览；鼠标经过记录不会弹出内容")
-        self._preview.setVisible(not hover and not compact and current is not None)
-        self._update_preview()
+        self._btn_preview_mode.setText("预览")
 
     def _toggle_preview(self) -> None:
-        if self.height() < 500:
-            self._set_preview_mode(self._preview_popup.isVisible() and not self._hover_preview)
-        else:
-            self._set_preview_mode(not self._hover_preview)
+        if self._preview_open:
+            self._close_preview()
+            return
+        if self._filter_timer.isActive():
+            self._filter_timer.stop()
+            self._apply_filter()
+        if self._item_at_current_row() is not None:
+            self._preview_open = True
+            self._preview_hover = False
+            self._btn_preview_mode.setText("关闭预览")
+            self._update_preview()
+
+    def _preview_at_position(self, widget: QListWidget, position: QPoint) -> None:
+        if self._preview_open or widget._drag_starting:
+            return
+        row = widget.itemAt(position)
+        if row is not None:
+            self._show_preview_popup(row.data(ROLE_ITEM))
+            self._preview_hover = True
+        elif self._preview_hover:
+            self._hide_preview_popup()
 
     def _sync_more_types(self) -> None:
         self._btn_more_types.setChecked(self._active_category != "all")
@@ -2632,9 +2642,7 @@ class ClipPanel(QWidget):
         if total == 0:
             filtered = bool(self._search.text().strip()) or self._active_category != "all"
             self._empty_state.setText("没有匹配的内容\n试试其他关键词，或切换到「全部」" if filtered else "还没有收藏\n点击记录右侧的星标，常用内容随时可取" if is_fav else "复制一段内容，从这里开始\n复制的文本、图片和文件会自动出现在这里")
-        compact = self.height() < 500
-        self._preview.setVisible(current is not None and not self._hover_preview and not compact)
-        self._btn_preview_mode.setText("预览" if self._hover_preview else "关闭预览" if compact and self._preview_popup.isVisible() else "预览内容" if compact else "收起预览")
+        self._btn_preview_mode.setText("关闭预览" if self._preview_open else "预览")
 
     def _apply_styles(self) -> None:
         c = theme_colors(self._theme_mode)
@@ -2680,7 +2688,6 @@ class ClipPanel(QWidget):
             QListWidget::item {{ border-bottom: 1px solid {c['border']}; }}
             QListWidget::item:selected {{ background: transparent; }}
             #emptyState {{ color: {c['muted']}; font-size: 14px; padding: 20px; }}
-            #previewCard {{ border: 0; border-top: 1px solid {c['border']}; background: {c['surface']}; }}
             #previewPopup {{ border: 1px solid {c['border']}; background: {c['surface']}; border-radius: 8px; }}
             #previewTitle {{ font-weight: 600; }}
             #previewMeta, #previewEmpty {{ color: {c['muted']}; font-size: 12px; }}

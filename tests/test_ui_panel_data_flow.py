@@ -239,7 +239,7 @@ def test_fav_drag_carries_payload_and_reorder_marker(monkeypatch) -> None:
         app.processEvents()
 
 
-def test_fav_drag_without_payload_still_allows_reorder(monkeypatch) -> None:
+def test_fav_image_drag_waits_for_payload_without_emitting_an_empty_file(monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     item = ClipboardItem(datetime.now(timezone.utc), "image", db_id=9, raw_size=5)
     dragged: list[QMimeData] = []
@@ -268,10 +268,9 @@ def test_fav_drag_without_payload_still_allows_reorder(monkeypatch) -> None:
     monkeypatch.setattr("cliphist.ui_panel.QDrag", FakeDrag)
     try:
         widget.startDrag(Qt.CopyAction)
-        assert len(dragged) == 1
-        mime = dragged[0]
-        assert bytes(mime.data(MIME_FAV_REORDER)) == b"fav-8"
-        assert not mime.hasText()
+        assert dragged == []
+        assert widget._pending_drag is None
+        assert not widget._drag_retry.isActive()
     finally:
         widget.deleteLater()
         app.processEvents()
@@ -353,6 +352,10 @@ def test_drag_waits_for_pending_image_blob_instead_of_starting_empty_drag(monkey
             raise AssertionError("empty image drag must not be started")
 
     monkeypatch.setattr("cliphist.ui_panel.QDrag", UnexpectedDrag)
+    held = [True]
+    monkeypatch.setattr(QApplication, "mouseButtons", lambda: Qt.LeftButton if held[0] else Qt.NoButton)
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(0, lambda: held.__setitem__(0, False))
     try:
         widget.startDrag(Qt.CopyAction)
         assert calls == [item]
@@ -379,23 +382,21 @@ def test_repeated_preview_requests_share_one_decode(monkeypatch) -> None:
         panel.resize(640, 620)
         panel._render_preview_content(
             item,
-            panel._preview_meta,
-            panel._preview_text,
-            panel._preview_image_label,
-            panel._preview_stack,
-            docked=True,
+            panel._popup_meta,
+            panel._popup_text,
+            panel._popup_image,
+            panel._popup_stack,
         )
         panel._render_preview_content(
             item,
-            panel._preview_meta,
-            panel._preview_text,
-            panel._preview_image_label,
-            panel._preview_stack,
-            docked=True,
+            panel._popup_meta,
+            panel._popup_text,
+            panel._popup_image,
+            panel._popup_stack,
         )
-        _process_until(app, lambda: panel._preview_image is not None)
+        _process_until(app, lambda: panel._popup_image_data is not None)
         assert decode_calls == 1
-        assert panel._preview_image is not None
+        assert panel._popup_image_data is not None
     finally:
         panel.close()
         panel.deleteLater()
