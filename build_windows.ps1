@@ -138,7 +138,28 @@ $pyinstallerArgs += @(
 )
 
 Write-Host "Building executable ($Mode)..."
-& $venvPython -m PyInstaller @pyinstallerArgs
+# A venv still inherits PATH. Third-party tools can provide DLLs with the same
+# names as Windows libraries (for example, Poppler's incompatible icuuc.dll).
+# Keep dependency discovery limited to Python, Qt's hooks, and Windows itself.
+$basePythonDir = & $venvPython -c "import sys; print(sys.base_prefix)"
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not determine the build interpreter's base directory."
+}
+$savedBuildPath = $env:PATH
+try {
+    $env:PATH = @(
+        (Join-Path $venvDir "Scripts"),
+        $basePythonDir,
+        (Join-Path $env:SystemRoot "System32"),
+        $env:SystemRoot
+    ) -join ";"
+    & $venvPython -m PyInstaller @pyinstallerArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed with exit code $LASTEXITCODE."
+    }
+} finally {
+    $env:PATH = $savedBuildPath
+}
 
 $exePath = if ($Mode -eq "onedir") {
     Join-Path $projectRoot "dist\ClipHist\ClipHist.exe"
