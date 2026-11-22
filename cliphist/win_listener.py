@@ -16,6 +16,7 @@ from .capture import capture_clipboard
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+MOD_NOREPEAT = getattr(win32con, "MOD_NOREPEAT", 0x4000)
 
 
 WM_CLIPBOARDUPDATE = 0x031D
@@ -164,7 +165,7 @@ class ClipboardListener:
             modifiers = int(lparam) & 0xFFFF
             vk = (int(lparam) >> 16) & 0xFFFF
             ctypes.set_last_error(0)
-            ok = bool(user32.RegisterHotKey(hwnd, int(wparam), int(modifiers), int(vk)))
+            ok = bool(user32.RegisterHotKey(hwnd, int(wparam), int(modifiers) | MOD_NOREPEAT, int(vk)))
             if ok:
                 self._hotkey_ids.add(int(wparam))
                 return 0
@@ -265,7 +266,7 @@ class ClipboardListener:
 
         hwnd = self._hwnd
         try:
-            item = capture_clipboard(hwnd=hwnd)
+            item = capture_clipboard(hwnd=hwnd, skip_own_writes=True)
             if item is not None:
                 self._on_event(item)
         except Exception:

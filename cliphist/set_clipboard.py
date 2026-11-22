@@ -7,7 +7,7 @@ log = logging.getLogger(__name__)
 import win32clipboard
 import win32con
 
-from .clipboard_util import open_clipboard
+from .clipboard_util import clipboard_is_owned_by, get_clipboard_sequence_number, open_clipboard
 from .models import ClipboardItem, MAX_IMAGE_BYTES, MAX_RICH_RAW_BYTES
 from .text_util import html_fragment_preview as _extract_html_fragment_preview
 from .text_util import rtf_to_plain_text as _rtf_preview
@@ -51,7 +51,13 @@ def _set_image_if_any(item: ClipboardItem) -> None:
     win32clipboard.SetClipboardData(win32con.CF_DIB, item.image_bytes)
 
 
-def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
+def set_clipboard_item(
+    item: ClipboardItem,
+    hwnd: int | None = None,
+    *,
+    track_sequence: bool = False,
+) -> int | None:
+    """Write an item and optionally return its final clipboard sequence."""
     # Validate before opening and, especially, before EmptyClipboard(). A
     # failed lazy blob load must not erase the user's current clipboard.
     _validate_item(item)
@@ -79,20 +85,14 @@ def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
         if item.item_type == "text":
             win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, item.text or "")
             _set_image_if_any(item)
-            return
-
-        if item.item_type == "files":
+        elif item.item_type == "files":
             win32clipboard.SetClipboardData(win32con.CF_HDROP, list(item.file_paths or ()))
-            return
-
-        if item.item_type == "image":
+        elif item.item_type == "image":
             raw_bytes = item.raw_bytes
             if raw_bytes is None:  # guarded by _validate_item; keep API defensive
                 raise ClipboardPayloadError("图片内容不可用，无法写入剪贴板")
             win32clipboard.SetClipboardData(win32con.CF_DIB, raw_bytes)
-            return
-
-        if item.item_type == "html":
+        elif item.item_type == "html":
             # Put a plain-text fallback first so a later format failure still
             # leaves the clipboard usable.
             win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain_text or "")
@@ -100,12 +100,20 @@ def set_clipboard_item(item: ClipboardItem, hwnd: int | None = None) -> None:
                 assert rich_format is not None
                 win32clipboard.SetClipboardData(rich_format, item.raw_bytes)
             _set_image_if_any(item)
-            return
-
-        if item.item_type == "rtf":
+        elif item.item_type == "rtf":
             win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, plain_text or "")
             if item.raw_bytes:
                 assert rich_format is not None
                 win32clipboard.SetClipboardData(rich_format, item.raw_bytes)
             _set_image_if_any(item)
-            return
+
+    if track_sequence and hwnd:
+        # Windows can add synthesized formats when the write closes. Reopen to
+        # check ownership and read the final sequence without a concurrent writer.
+        try:
+            with open_clipboard(hwnd):
+                if clipboard_is_owned_by(hwnd):
+                    return get_clipboard_sequence_number()
+        except Exception:
+            log.debug("确认剪贴板写入序列失败", exc_info=True)
+    return None

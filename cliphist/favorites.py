@@ -86,11 +86,15 @@ class FavoriteEntry:
     raw_blob: str | None = None
     image_blob: str | None = None
 
+    def __post_init__(self) -> None:
+        self.item = self.item.with_db_id(None)
+
 
 class FavoritesStore:
     def __init__(self, entries: list[FavoriteEntry] | None = None) -> None:
         self._entries: list[FavoriteEntry] = entries[:] if entries else []
         self._lock = RLock()
+        self._io_lock = RLock()
 
     @property
     def entries(self) -> list[FavoriteEntry]:
@@ -302,36 +306,55 @@ class FavoritesStore:
     def save(self) -> None:
         path = self.path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        referenced: set[str] = set()
-        favorites: list[dict] = []
-        with self._lock:
-            for entry in self._entries:
-                raw_ref = entry.raw_blob
-                image_ref = entry.image_blob
-                if entry.item.raw_bytes is not None and raw_ref is None:
-                    raw_ref = self._write_blob(entry.item.raw_bytes)
-                if entry.item.image_bytes is not None and image_ref is None:
-                    image_ref = self._write_blob(entry.item.image_bytes)
-                if raw_ref:
-                    referenced.add(raw_ref)
-                if image_ref:
-                    referenced.add(image_ref)
-                entry.raw_blob = raw_ref
-                entry.image_blob = image_ref
-                entry.item = entry.item.slim(fingerprint=entry.fav_id)
-                favorites.append({"id": entry.fav_id, "item": _encode_item(entry.item, raw_ref, image_ref)})
-        data = {"favorites": favorites}
-        temp_path = path + ".tmp"
-        try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_path, path)
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-        self._prune_blobs(referenced)
+        with self._io_lock:
+            while True:
+                pending_blobs: list[tuple[FavoriteEntry, bytes | None, bytes | None]] = []
+                with self._lock:
+                    for entry in self._entries:
+                        need_raw = entry.item.raw_bytes if entry.item.raw_bytes is not None and entry.raw_blob is None else None
+                        need_img = entry.item.image_bytes if entry.item.image_bytes is not None and entry.image_blob is None else None
+                        if need_raw is not None or need_img is not None:
+                            pending_blobs.append((entry, need_raw, need_img))
+                    if not pending_blobs:
+                        referenced: set[str] = set()
+                        favorites: list[dict] = []
+                        for entry in self._entries:
+                            raw_ref = entry.raw_blob
+                            image_ref = entry.image_blob
+                            if raw_ref:
+                                referenced.add(raw_ref)
+                            if image_ref:
+                                referenced.add(image_ref)
+                            entry.item = entry.item.slim(fingerprint=entry.fav_id)
+                            favorites.append({"id": entry.fav_id, "item": _encode_item(entry.item, raw_ref, image_ref)})
+                        break
+
+                written: list[tuple[FavoriteEntry, str | None, str | None]] = []
+                for entry, need_raw, need_img in pending_blobs:
+                    raw_ref = self._write_blob(need_raw) if need_raw is not None else None
+                    image_ref = self._write_blob(need_img) if need_img is not None else None
+                    written.append((entry, raw_ref, image_ref))
+
+                with self._lock:
+                    for entry, raw_ref, image_ref in written:
+                        if raw_ref is not None and entry.raw_blob is None:
+                            entry.raw_blob = raw_ref
+                        if image_ref is not None and entry.image_blob is None:
+                            entry.image_blob = image_ref
+                        entry.item = entry.item.slim(fingerprint=entry.fav_id)
+
+            data = {"favorites": favorites}
+            temp_path = path + ".tmp"
+            try:
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+            self._prune_blobs(referenced)

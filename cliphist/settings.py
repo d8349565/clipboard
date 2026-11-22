@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass
+from tempfile import NamedTemporaryFile
 
 from .autostart import is_autostart_enabled
 from .themes import normalize_theme
@@ -57,8 +58,8 @@ def load_settings() -> AppSettings:
     auto_paste = bool(data.get("auto_paste", False))
     autostart_enabled = bool(data.get("autostart_enabled", is_autostart_enabled()))
     db_path = data.get("db_path") or None
-    hotkey_show_panel = str(data.get("hotkey_show_panel") or "Alt+C")
-    hotkey_toggle_pause = str(data.get("hotkey_toggle_pause") or "Alt+P")
+    hotkey_show_panel = str(data["hotkey_show_panel"]) if "hotkey_show_panel" in data and data["hotkey_show_panel"] is not None else "Alt+C"
+    hotkey_toggle_pause = str(data["hotkey_toggle_pause"]) if "hotkey_toggle_pause" in data and data["hotkey_toggle_pause"] is not None else "Alt+P"
     panel_width = int(data.get("panel_width", 640))
     panel_height = int(data.get("panel_height", 620))
     panel_width = max(400, min(panel_width, 1600))
@@ -78,9 +79,23 @@ def load_settings() -> AppSettings:
 
 
 def save_settings(settings: AppSettings) -> None:
-    app_dir = default_app_dir()
-    os.makedirs(app_dir, exist_ok=True)
     path = default_config_path()
-    data = asdict(settings)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temp_path: str | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory, prefix=".config-", suffix=".tmp", delete=False,
+        ) as file:
+            temp_path = file.name
+            json.dump(asdict(settings), file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                log.debug("清理临时配置文件失败", exc_info=True)

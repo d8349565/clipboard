@@ -3,14 +3,14 @@
 import ctypes
 import logging
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal
 
 log = logging.getLogger(__name__)
 
 import win32clipboard
 import win32con
 
-from .clipboard_util import open_clipboard
+from .clipboard_util import clipboard_is_owned_by, open_clipboard
 from .models import ClipboardItem, MAX_IMAGE_BYTES, MAX_RICH_RAW_BYTES
 from .text_util import (
     html_fragment_preview as _extract_html_fragment_preview,
@@ -23,9 +23,10 @@ RTF_FORMAT_NAME: Final[str] = "Rich Text Format"
 
 
 @dataclass(frozen=True, slots=True)
-class OversizedImageNotice:
-    """剪贴板中存在超过大小上限的图片，已跳过记录。用于提示用户而非静默丢弃。"""
+class OversizedClipboardNotice:
+    """A clipboard payload was too large and had no usable fallback format."""
 
+    item_type: Literal["image", "html", "rtf"]
     size: int
     limit: int
 
@@ -130,8 +131,22 @@ def _capture_image_bytes(max_bytes: int = MAX_IMAGE_BYTES) -> tuple[bytes | None
     return None, oversized
 
 
-def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImageNotice | None:
+def _has_image_format() -> bool:
+    dibv5_fmt = getattr(win32con, "CF_DIBV5", 17)
+    return bool(
+        win32clipboard.IsClipboardFormatAvailable(dibv5_fmt)
+        or win32clipboard.IsClipboardFormatAvailable(win32con.CF_DIB)
+    )
+
+
+def capture_clipboard(
+    hwnd: int | None = None,
+    *,
+    skip_own_writes: bool = False,
+) -> ClipboardItem | OversizedClipboardNotice | None:
     with open_clipboard(hwnd):
+        if skip_own_writes and hwnd and clipboard_is_owned_by(hwnd):
+            return None
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
             try:
                 file_paths = tuple(win32clipboard.GetClipboardData(win32con.CF_HDROP))
@@ -144,47 +159,48 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                     file_paths=file_paths,
                 ).prepared()
 
-        html_fmt = _get_html_fmt()
-        if win32clipboard.IsClipboardFormatAvailable(html_fmt):
-            try:
-                raw_b = _to_bytes(win32clipboard.GetClipboardData(html_fmt))
-            except Exception:
-                log.debug("读取剪贴板 HTML 失败", exc_info=True)
-            else:
-                if not raw_b:
-                    raw_b = b""
-                preview = _extract_html_fragment_preview(raw_b)
-                keep_raw = raw_b
-                if len(raw_b) > MAX_RICH_RAW_BYTES:
-                    log.warning("HTML payload exceeds limit (%d bytes), keep preview only", len(raw_b))
-                    keep_raw = None
-                return ClipboardItem(
-                    created_at=ClipboardItem.now_utc(),
-                    item_type="html",
-                    text=preview,
-                    raw_bytes=keep_raw,
-                ).prepared()
+        has_image = _has_image_format()
+        fallback: ClipboardItem | None = None
+        oversized_rich: OversizedClipboardNotice | None = None
+        for kind, get_format, preview_of in (
+            ("html", _get_html_fmt, _extract_html_fragment_preview),
+            ("rtf", _get_rtf_fmt, _rtf_preview),
+        ):
+            fmt = get_format()
+            if not win32clipboard.IsClipboardFormatAvailable(fmt):
+                continue
+            size = _clipboard_data_size(fmt)
+            if size is not None and size > MAX_RICH_RAW_BYTES:
+                log.warning("%s payload exceeds limit (%d bytes), falling back to lighter formats", kind.upper(), size)
+                oversized_rich = oversized_rich or OversizedClipboardNotice(kind, size, MAX_RICH_RAW_BYTES)
+                continue
 
-        rtf_fmt = _get_rtf_fmt()
-        if win32clipboard.IsClipboardFormatAvailable(rtf_fmt):
             try:
-                raw_b = _to_bytes(win32clipboard.GetClipboardData(rtf_fmt))
+                raw = _to_bytes(win32clipboard.GetClipboardData(fmt))
             except Exception:
-                log.debug("读取剪贴板 RTF 失败", exc_info=True)
-            else:
-                if not raw_b:
-                    raw_b = b""
-                preview = _rtf_preview(raw_b)
-                keep_raw = raw_b
-                if len(raw_b) > MAX_RICH_RAW_BYTES:
-                    log.warning("RTF payload exceeds limit (%d bytes), keep preview only", len(raw_b))
-                    keep_raw = None
-                return ClipboardItem(
-                    created_at=ClipboardItem.now_utc(),
-                    item_type="rtf",
-                    text=preview,
-                    raw_bytes=keep_raw,
-                ).prepared()
+                log.debug("读取剪贴板 %s 失败", kind.upper(), exc_info=True)
+                continue
+            if not raw:
+                continue
+
+            preview = preview_of(raw, empty="")
+            keep_raw = len(raw) <= MAX_RICH_RAW_BYTES
+            if not keep_raw:
+                log.warning("%s payload exceeds limit (%d bytes)", kind.upper(), len(raw))
+                if not preview:
+                    oversized_rich = oversized_rich or OversizedClipboardNotice(kind, len(raw), MAX_RICH_RAW_BYTES)
+                    continue
+            item = ClipboardItem(
+                created_at=ClipboardItem.now_utc(),
+                item_type=kind,
+                text=preview,
+                raw_bytes=raw if keep_raw else None,
+            )
+            if preview or not has_image:
+                return item.prepared()
+            # Image-only rich data remains usable if the accompanying bitmap cannot be read.
+            if fallback is None:
+                fallback = item
 
         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
             try:
@@ -194,11 +210,11 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
             else:
                 if isinstance(text, bytes):
                     text = text.decode("utf-16-le", errors="replace")
-                return ClipboardItem(
-                    created_at=ClipboardItem.now_utc(),
-                    item_type="text",
-                    text=str(text),
-                ).prepared()
+                text_str = str(text)
+                if text_str.strip() or (not has_image and oversized_rich is None):
+                    return ClipboardItem(
+                        created_at=ClipboardItem.now_utc(), item_type="text", text=text_str
+                    ).prepared()
 
         image_bytes, oversized = _capture_image_bytes(MAX_IMAGE_BYTES)
         if image_bytes:
@@ -207,7 +223,8 @@ def capture_clipboard(hwnd: int | None = None) -> ClipboardItem | OversizedImage
                 item_type="image",
                 raw_bytes=image_bytes,
             ).prepared()
+        if fallback is not None:
+            return fallback.prepared()
         if oversized:
-            return OversizedImageNotice(size=oversized, limit=MAX_IMAGE_BYTES)
-
-    return None
+            return OversizedClipboardNotice("image", oversized, MAX_IMAGE_BYTES)
+        return oversized_rich

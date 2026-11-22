@@ -35,6 +35,13 @@ BackupDatabase = Callable[[str], tuple[bool, str | None]]
 DatabaseSummary = Callable[[str], str]
 
 
+def _stored_key_sequence(value: str) -> QKeySequence:
+    # Older configurations may contain ClipHist's display names for these keys.
+    aliases = {"WIN": "Meta", "PAGEUP": "PgUp", "PAGEDOWN": "PgDown"}
+    parts = (part.strip() for part in value.split("+"))
+    return QKeySequence.fromString("+".join(aliases.get(part.upper(), part) for part in parts), QKeySequence.PortableText)
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -96,8 +103,8 @@ class SettingsDialog(QDialog):
         self._autostart = QCheckBox("开机时随 Windows 启动 ClipHist", card)
         self._panel_width = QSpinBox(card)
         self._panel_height = QSpinBox(card)
-        self._hotkey_show.setKeySequence(QKeySequence(settings.hotkey_show_panel))
-        self._hotkey_pause.setKeySequence(QKeySequence(settings.hotkey_toggle_pause))
+        self._hotkey_show.setKeySequence(_stored_key_sequence(settings.hotkey_show_panel))
+        self._hotkey_pause.setKeySequence(_stored_key_sequence(settings.hotkey_toggle_pause))
         self._max_items.setRange(50, MAX_ITEMS_LIMIT)
         self._max_items.setSingleStep(50)
         self._max_items.setValue(settings.max_items)
@@ -379,4 +386,6 @@ class SettingsDialog(QDialog):
         if not ok:
             QMessageBox.warning(self, "设置", msg or "保存失败")
             return
+        if msg:
+            QMessageBox.warning(self, "设置", msg)
         self.accept()

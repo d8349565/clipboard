@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, replace as _dc_replace
+from dataclasses import dataclass, field, replace as _dc_replace
 from datetime import datetime, timezone
 from typing import Literal, Sequence
 
@@ -64,14 +64,14 @@ def _search_text_lower(item: "ClipboardItem") -> str:
         source = "\n".join(item.file_paths or ())
     else:
         source = item.text or ""
-    return " ".join(source.replace("\r", "\n").split()).lower()
+    return " ".join(source.split()).lower()
 
 
 def _display_type_for(item: "ClipboardItem", search_index: str | None = None) -> str:
     """Return the UI category without requiring the filter to rescan raw text."""
     if item.item_type == "text":
-        source = search_index if search_index is not None else (item.text or "")
-        if source and _RE_URL.search(source):
+        source = (search_index if search_index is not None else (item.text or "")).strip()
+        if source and len(source) <= 2048 and _RE_URL.fullmatch(source):
             return "link"
     return item.item_type
 
@@ -92,6 +92,8 @@ class ClipboardItem:
     _fingerprint: str | None = None
     _search_index: str | None = None
     _display_type: str | None = None
+    # Stable across copies of the same record within this session.
+    record_key: object = field(default_factory=object, repr=False, compare=False)
 
     @staticmethod
     def now_utc() -> datetime:
@@ -147,8 +149,8 @@ class ClipboardItem:
             return self
         return _dc_replace(self, _search_index=search_index, _display_type=display_type)
 
-    def with_db_id(self, db_id: int) -> ClipboardItem:
-        return _dc_replace(self, db_id=db_id)
+    def with_db_id(self, db_id: int | None) -> ClipboardItem:
+        return self if self.db_id == db_id else _dc_replace(self, db_id=db_id)
 
     def with_blobs(self, raw_bytes: bytes | None, image_bytes: bytes | None) -> ClipboardItem:
         """Return a copy with blob fields restored (from DB on-demand load)."""
@@ -184,8 +186,13 @@ class ClipboardItem:
 
     def preview(self, max_len: int = 120) -> str:
         if self.item_type == "text":
-            s = (self.text or "").replace("\r\n", "\n").replace("\r", "\n")
-            return s if len(s) <= max_len else s[: max_len - 1] + "…"
+            raw_text = self.text or ""
+            # Slice before normalizing line endings so multi-MB text never copies twice.
+            sample = raw_text if len(raw_text) <= max_len * 2 + 2 else raw_text[: max_len * 2 + 2]
+            s = sample.replace("\r\n", "\n").replace("\r", "\n")
+            if len(s) > max_len or len(raw_text) > len(sample):
+                return s[: max_len - 1] + "…"
+            return s
         if self.item_type == "files":
             paths: Sequence[str] = self.file_paths or ()
             if not paths:
@@ -197,7 +204,11 @@ class ClipboardItem:
             size = self.raw_size or len(self.raw_bytes or b"")
             return f"(图片 {size} bytes)"
         if self.item_type in ("html", "rtf"):
-            s = (self.text or "").replace("\r\n", "\n").replace("\r", "\n")
+            raw_text = self.text or ""
+            sample = raw_text if len(raw_text) <= max_len * 2 + 2 else raw_text[: max_len * 2 + 2]
+            s = sample.replace("\r\n", "\n").replace("\r", "\n")
             if s:
-                return s if len(s) <= max_len else s[: max_len - 1] + "…"
+                if len(s) > max_len or len(raw_text) > len(sample):
+                    return s[: max_len - 1] + "…"
+                return s
         return f"({self.item_type})"

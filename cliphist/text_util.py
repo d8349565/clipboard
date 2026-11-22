@@ -86,7 +86,7 @@ def html_to_plain_text(s: str, max_len: int = 400) -> str:
     return s[:max_len]
 
 
-def html_fragment_preview(raw: bytes, max_len: int = 400) -> str:
+def html_fragment_preview(raw: bytes, max_len: int = 400, *, empty: str = "(HTML)") -> str:
     """Return a plain-text preview extracted from a CF_HTML blob."""
     fragment = extract_html_fragment(raw)
     if fragment:
@@ -94,18 +94,63 @@ def html_fragment_preview(raw: bytes, max_len: int = 400) -> str:
     try:
         s = raw.decode("utf-8", errors="ignore")
     except Exception:
-        return "(HTML)"
+        return empty
     plain = html_to_plain_text(s, max_len=max_len)
-    return plain or "(HTML)"
+    return plain or empty
 
 
-def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
+_RE_RTF_SPECIAL = re.compile(r"[{}\\]")
+
+
+def _skip_rtf_group_body(s: str, i: int, n: int) -> int:
+    """Fast-forward inside a skipped RTF destination until a '{' or '}' token.
+
+    This avoids Python-level per-character iteration over megabytes of hex
+    image data inside ``{\\pict ...}`` or ``{\\objdata ...}``.
+    """
+    depth = 0
+    while i < n:
+        match = _RE_RTF_SPECIAL.search(s, i)
+        if match is None:
+            return n
+        pos = match.start()
+        ch = s[pos]
+        if ch == "\\":
+            # Escaped brace or backslash does not affect group nesting.
+            i = pos + 2
+            continue
+        if ch == "{":
+            depth += 1
+            i = pos + 1
+            continue
+        # ch == "}"
+        if depth == 0:
+            return pos
+        depth -= 1
+        i = pos + 1
+    return n
+
+
+def rtf_to_plain_text(raw: bytes, max_len: int = 400, *, empty: str = "(RTF)") -> str:
     """Convert raw RTF bytes to plain text, skipping formatting destinations."""
     try:
         s = raw.decode("latin-1", errors="ignore")
     except Exception:
-        return "(RTF)"
+        return empty
     out: list[str] = []
+    visible_chars = 0
+
+    def append_char(char: str) -> None:
+        nonlocal visible_chars
+        if not char:
+            return
+        if char.isspace():
+            if not out:
+                return
+        else:
+            visible_chars += 1
+        out.append(char)
+
     stack: list[tuple[bool, int]] = []
     skip_group = False
     uc_skip = 1
@@ -115,6 +160,21 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
     i = 0
     n = len(s)
     while i < n:
+        # Visible characters survive whitespace cleanup, so this is a safe early exit.
+        if max_len > 0 and visible_chars >= max_len:
+            break
+        if skip_group:
+            i = _skip_rtf_group_body(s, i, n)
+            if i >= n:
+                break
+            if stack:
+                skip_group, uc_skip = stack.pop()
+            else:
+                skip_group = False
+            pending_ignorable = False
+            i += 1
+            continue
+
         ch = s[i]
 
         if skip_after_unicode > 0:
@@ -154,8 +214,7 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
 
         if ch != "\\":
             pending_ignorable = False
-            if not skip_group:
-                out.append(ch)
+            append_char(ch)
             i += 1
             continue
 
@@ -165,8 +224,7 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
         ctrl = s[i]
 
         if ctrl in "{}\\":
-            if not skip_group:
-                out.append(ctrl)
+            append_char(ctrl)
             i += 1
             continue
 
@@ -180,8 +238,7 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
                 hex_code = s[i + 1 : i + 3]
                 try:
                     b = int(hex_code, 16)
-                    if not skip_group:
-                        out.append(bytes((b,)).decode("cp1252", errors="ignore"))
+                    append_char(bytes((b,)).decode("cp1252", errors="ignore"))
                     i += 3
                     continue
                 except Exception:
@@ -217,20 +274,18 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
             pending_ignorable = False
 
             if word in ("par", "line"):
-                if not skip_group:
-                    out.append("\n")
+                append_char("\n")
                 continue
             if word == "tab":
-                if not skip_group:
-                    out.append("\t")
+                append_char("\t")
                 continue
             if word == "uc" and num is not None:
                 uc_skip = max(0, num)
                 continue
-            if word == "u" and num is not None and not skip_group:
+            if word == "u" and num is not None:
                 code = num if num >= 0 else num + 65536
                 try:
-                    out.append(chr(code))
+                    append_char(chr(code))
                 except Exception:
                     pass
                 skip_after_unicode = max(0, uc_skip)
@@ -238,13 +293,12 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
             continue
 
         pending_ignorable = False
-        if not skip_group:
-            if ctrl == "~":
-                out.append(" ")
-            elif ctrl in ("-", "_"):
-                out.append("-")
-            else:
-                out.append(ctrl)
+        if ctrl == "~":
+            append_char(" ")
+        elif ctrl in ("-", "_"):
+            append_char("-")
+        else:
+            append_char(ctrl)
         i += 1
 
     text = "".join(out).replace("\r\n", "\n").replace("\r", "\n")
@@ -253,5 +307,5 @@ def rtf_to_plain_text(raw: bytes, max_len: int = 400) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip()
     if not text:
-        return "(RTF)"
+        return empty
     return text[:max_len]

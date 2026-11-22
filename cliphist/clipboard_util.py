@@ -1,6 +1,7 @@
 """Shared clipboard utilities used by capture and set_clipboard modules."""
 from __future__ import annotations
 
+import ctypes
 import logging
 import time
 from contextlib import contextmanager
@@ -8,6 +9,24 @@ from contextlib import contextmanager
 import win32clipboard
 
 log = logging.getLogger(__name__)
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_user32.GetClipboardSequenceNumber.argtypes = []
+_user32.GetClipboardSequenceNumber.restype = ctypes.c_uint32
+
+
+def get_clipboard_sequence_number() -> int | None:
+    """Return the current Win32 clipboard sequence number, or None on failure."""
+    try:
+        seq = int(_user32.GetClipboardSequenceNumber())
+        return seq if seq > 0 else None
+    except Exception:
+        return None
+
+
+def clipboard_is_owned_by(hwnd: int) -> bool:
+    """Check the owner while the caller holds the open clipboard."""
+    return win32clipboard.GetClipboardOwner() == hwnd
 
 
 @contextmanager

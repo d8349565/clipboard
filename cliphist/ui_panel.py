@@ -80,7 +80,7 @@ _HELP_SECTIONS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "🚀", "快速上手",
         [
             ("启动", "程序启动后最小化至系统托盘，不占用任务栏。"),
-            ("打开面板", "按 Alt+C（默认）或双击托盘图标，面板会在鼠标附近弹出。"),
+            ("打开面板", "按 Alt+C（默认）或单击托盘图标，面板会在鼠标附近弹出。"),
             ("使用记录", "双击列表项或选中后按 Enter，即可将内容重新写入剪切板并自动关闭面板。"),
             ("关闭面板", "按 Esc 或点击右上角 ✕，面板隐藏到后台，程序继续监听剪切板。"),
         ],
@@ -1057,7 +1057,7 @@ class ClipPanel(QWidget):
 
     def __init__(
         self,
-        on_activate: Callable[[ClipboardItem, bool | None], None],
+        on_activate: Callable[[ClipboardItem, bool | None], bool | None],
         on_clear: Callable[[], None] | None = None,
         on_open_settings: Callable[[], None] | None = None,
         get_favorites: Callable[[], list[tuple[str, ClipboardItem]]] | None = None,
@@ -1065,13 +1065,17 @@ class ClipPanel(QWidget):
         remove_favorite: Callable[[str], tuple[bool, str | None]] | None = None,
         remove_favorites: Callable[[list[str]], tuple[bool, str | None]] | None = None,
         reorder_favorites: Callable[[list[str]], tuple[bool, str | None]] | None = None,
-        edit_item: Callable[[ClipboardItem, ClipboardItem], tuple[bool, str | None]] | None = None,
+        edit_item: Callable[[ClipboardItem, ClipboardItem, bool], tuple[bool, str | None]] | None = None,
         delete_items: Callable[[list[ClipboardItem]], tuple[bool, str | None]] | None = None,
         load_blobs: Callable[[ClipboardItem], ClipboardItem] | None = None,
         on_toggle_pause: Callable[[], None] | None = None,
+        on_resize: Callable[[int, int], None] | None = None,
+        blob_load_failed: Callable[[ClipboardItem], bool] | None = None,
     ) -> None:
         super().__init__()
         self._on_toggle_pause = on_toggle_pause
+        self._on_resize = on_resize
+        self._programmatic_resize = False
         self._theme_mode = "system"
         self._auto_paste = False
         self._ignore_star_release = False
@@ -1087,10 +1091,14 @@ class ClipPanel(QWidget):
         self._edit_item = edit_item
         self._delete_items = delete_items
         self._load_blobs = load_blobs
+        self._blob_load_failed = blob_load_failed or (lambda _item: False)
         self._all_items: list[ClipboardItem] = []
         self._filtered_items: list[ClipboardItem] = []
         self._favorites: list[tuple[str, ClipboardItem]] = []
         self._fav_filtered: list[tuple[str, ClipboardItem]] = []
+        self._live_keys: set[tuple] = set()
+        self._row_text_cache: dict[tuple, tuple[str, str]] = {}
+        self._tab_dirty: list[bool] = [True, True]
         self._search_cache: dict[tuple, str] = {}
         self._all_page = 0
         self._fav_page = 0
@@ -1116,11 +1124,7 @@ class ClipPanel(QWidget):
 
         card = QFrame(self)
         card.setObjectName("card")
-        shadow = QGraphicsDropShadowEffect(card)
-        shadow.setBlurRadius(22)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QColor(0, 0, 0, 90))
-        card.setGraphicsEffect(shadow)
+        self._card = card
 
         self._search = QLineEdit(card)
         self._search.setPlaceholderText("搜索复制过的内容…")
@@ -1306,6 +1310,11 @@ class ClipPanel(QWidget):
         self._preview_resize_timer.setInterval(80)
         self._preview_resize_timer.timeout.connect(self._refresh_image_previews)
 
+        self._resize_save_timer = QTimer(self)
+        self._resize_save_timer.setSingleShot(True)
+        self._resize_save_timer.setInterval(400)
+        self._resize_save_timer.timeout.connect(self._emit_resized)
+
         title_bar = QHBoxLayout()
         title_bar.setSpacing(8)
         self._title = QLabel("ClipHist", card)
@@ -1456,6 +1465,8 @@ class ClipPanel(QWidget):
         self._delegate_fav.clear_caches(keep_thumbnails=True)
         live_keys = {self._item_cache_key(item) for item in items}
         live_keys.update(self._item_cache_key(item) for _, item in favorites)
+        self._live_keys = live_keys
+        self._row_text_cache = {key: value for key, value in self._row_text_cache.items() if key in live_keys}
         self._search_cache = {key: value for key, value in self._search_cache.items() if key in live_keys}
         self._visual_blob_waiting.intersection_update(live_keys)
         self._visual_blob_pending.intersection_update(live_keys)
@@ -1466,8 +1477,38 @@ class ClipPanel(QWidget):
             len(item.raw_bytes or b"") + len(item.image_bytes or b"")
             for item in self._visual_blob_cache.values()
         )
+        self._tab_dirty = [True, True]
         if self.isVisible():
             self._apply_filter()
+
+    def prewarm(self) -> None:
+        """Warm up native window handle and SVG icon cache away from Alt+C."""
+        if self._panel_closed:
+            return
+        try:
+            self.winId()
+        except Exception:
+            pass
+        colors = theme_colors(self._theme_mode)
+        dpr = self._image_dpr(self)
+        for kind in ("text", "files", "link", "image", "html", "rtf"):
+            type_icon(kind, colors["muted"], 24, dpr)
+        type_icon("star", colors["muted"], 20, dpr, False)
+        type_icon("star", colors["accent"], 20, dpr, True)
+
+    def apply_configured_size(self, width: int, height: int) -> None:
+        self._programmatic_resize = True
+        try:
+            self.resize(width, height)
+        finally:
+            self._programmatic_resize = False
+
+    def set_status_hint(self, message: str) -> None:
+        self._keyboard_hint.setText(message or "Tab 切换  ·  ↑↓ 选择")
+
+    def _emit_resized(self) -> None:
+        if self._on_resize is not None and not self._panel_closed:
+            self._on_resize(self.width(), self.height())
 
     def set_items(self, items: list[ClipboardItem]) -> None:
         self.set_data(items, self._favorites)
@@ -1477,20 +1518,10 @@ class ClipPanel(QWidget):
 
     @staticmethod
     def _item_cache_key(item: ClipboardItem) -> tuple:
-        if item.db_id is not None:
-            return ("db", item.db_id)
-        if item._fingerprint:
-            return ("fp", item._fingerprint)
-        return ("obj", id(item))
+        return (item.record_key, item._fingerprint)
 
     def _is_live_item_key(self, key: tuple) -> bool:
-        return any(
-            self._item_cache_key(item) == key
-            for item in self._all_items
-        ) or any(
-            self._item_cache_key(item) == key
-            for _, item in self._favorites
-        )
+        return key in self._live_keys
 
     def _cache_visual_blob(self, key: tuple, item: ClipboardItem) -> None:
         previous = self._visual_blob_cache.pop(key, None)
@@ -1503,7 +1534,7 @@ class ClipPanel(QWidget):
             self._visual_blob_cache_bytes -= len(evicted.raw_bytes or b"") + len(evicted.image_bytes or b"")
 
     def _schedule_visual_blob_load(self, item: ClipboardItem) -> None:
-        if self._panel_closed or self._load_blobs is None:
+        if self._panel_closed or self._load_blobs is None or self._blob_load_failed(item):
             return
         key = self._item_cache_key(item)
         if key in self._visual_blob_pending or key in self._visual_blob_waiting:
@@ -1523,11 +1554,12 @@ class ClipPanel(QWidget):
             loaded.raw_bytes is not None or loaded.image_bytes is not None
         ):
             self._cache_visual_blob(key, loaded)
-        elif loaded is not None and loaded.needs_blob_load:
-            # The application loader has queued the DB read.  Wait for its
-            # notify_blob_loaded() callback before trying again.
+            self.notify_blob_loaded()
+        elif loaded is not None and loaded.needs_blob_load and not self._blob_load_failed(item):
+            # The application loader has queued the DB read. Wait for its
+            # notify_blob_loaded() callback instead of triggering an immediate
+            # repaint loop on the UI thread.
             self._visual_blob_waiting.add(key)
-        self.notify_blob_loaded()
 
     def _request_thumbnail(self, item: ClipboardItem, size: int, dpr: float) -> QPixmap | None:
         source_key = self._item_cache_key(item)
@@ -1597,9 +1629,9 @@ class ClipPanel(QWidget):
         self._list_all.viewport().update()
         self._list_fav.viewport().update()
         if self._preview_open:
-            self._update_preview()
+            self._update_preview(force=True)
         elif self._preview_popup.isVisible() and self._popup_item is not None:
-            self._show_preview_popup(self._popup_item)
+            self._show_preview_popup(self._popup_item, force=True)
 
     def _ensure_blobs(self, it: ClipboardItem) -> ClipboardItem:
         """Load blob data on-demand from the DB via the callback."""
@@ -1632,14 +1664,29 @@ class ClipPanel(QWidget):
         screen = QGuiApplication.screenAt(cursor_pos) or QGuiApplication.primaryScreen()
         screen_geo = screen.availableGeometry()
 
-        x = min(max(cursor_pos.x() - self.width() // 2, screen_geo.left()), screen_geo.right() - self.width())
-        y = min(max(cursor_pos.y() + 18, screen_geo.top()), screen_geo.bottom() - self.height())
+        x = max(screen_geo.left(), min(cursor_pos.x() - self.width() // 2, screen_geo.right() + 1 - self.width()))
+        y = max(screen_geo.top(), min(cursor_pos.y() + 18, screen_geo.bottom() + 1 - self.height()))
         self.move(x, y)
 
         self.show()
         self.raise_()
         self.activateWindow()
+        self._search.setFocus()
         QTimer.singleShot(0, self._search.setFocus)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        card_rect = self._card.geometry()
+        for expand, alpha in ((8, 5), (6, 9), (4, 14), (2, 20)):
+            painter.setBrush(QColor(0, 0, 0, alpha))
+            painter.drawRoundedRect(
+                card_rect.adjusted(-expand, -expand + 2, expand, expand + 2),
+                14 + expand // 2,
+                14 + expand // 2,
+            )
+        painter.end()
 
     def keyPressEvent(self, event):  # type: ignore[override]
         if event.key() == Qt.Key_F and event.modifiers() & Qt.ControlModifier:
@@ -1647,7 +1694,10 @@ class ClipPanel(QWidget):
             self._search.selectAll()
             return
         if event.key() == Qt.Key_Escape:
-            self.hide()
+            if self._preview_open:
+                self._close_preview()
+            else:
+                self.hide()
             return
         if event.key() == Qt.Key_F and event.modifiers() & Qt.AltModifier:
             self._toggle_current_favorite()
@@ -1685,6 +1735,18 @@ class ClipPanel(QWidget):
         preview_resize_timer = getattr(self, "_preview_resize_timer", None)
         if preview_resize_timer is not None:
             preview_resize_timer.start()
+        if (
+            self.isVisible()
+            and not self._programmatic_resize
+            and self._on_resize is not None
+            and hasattr(self, "_resize_save_timer")
+        ):
+            self._resize_save_timer.start()
+
+    def moveEvent(self, event) -> None:  # type: ignore[override]
+        super().moveEvent(event)
+        if hasattr(self, "_preview_popup") and self._preview_popup.isVisible() and self._popup_item is not None:
+            self._position_preview_popup()
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         self._panel_closed = False
@@ -1694,6 +1756,9 @@ class ClipPanel(QWidget):
     def hideEvent(self, event) -> None:  # type: ignore[override]
         for widget in (self._list_all, self._list_fav):
             widget.cancel_pending_drag()
+        self._visual_blob_pending.clear()
+        self._visual_blob_waiting.clear()
+        self.set_status_hint("")
         self._close_preview()
         super().hideEvent(event)
 
@@ -1701,6 +1766,7 @@ class ClipPanel(QWidget):
         self._panel_closed = True
         self._filter_timer.stop()
         self._preview_resize_timer.stop()
+        self._resize_save_timer.stop()
         self._visual_blob_pending.clear()
         self._visual_blob_waiting.clear()
         self._image_decode.close()
@@ -1768,7 +1834,10 @@ class ClipPanel(QWidget):
                 self._toggle_current_favorite()
                 return True
             if main_focus and key == Qt.Key_Escape:
-                self.hide()
+                if self._preview_open:
+                    self._close_preview()
+                else:
+                    self.hide()
                 return True
             if main_focus and content_focus and obj is not self._search and key == Qt.Key_Delete and modifiers == Qt.NoModifier:
                 if self._tabs.currentIndex() == 1:
@@ -1776,7 +1845,13 @@ class ClipPanel(QWidget):
                 else:
                     self._delete_selected_history()
                 return True
-            if main_focus and key == Qt.Key_Control and not self._preview_open:
+            if (
+                main_focus
+                and key == Qt.Key_Control
+                and not self._preview_open
+                and obj is not self._search
+                and QApplication.mouseButtons() == Qt.NoButton
+            ):
                 widget = self._current_list()
                 self._preview_at_position(widget, widget.viewport().mapFromGlobal(QCursor.pos()))
             if main_focus and key in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
@@ -1804,6 +1879,20 @@ class ClipPanel(QWidget):
             if main_focus and key == Qt.Key_Space and event.modifiers() == Qt.NoModifier and obj in (self._list_all, self._list_fav):
                 self._toggle_preview()
                 return True
+            if (
+                main_focus
+                and obj in (self._list_all, self._list_fav)
+                and modifiers in (Qt.NoModifier, Qt.ShiftModifier)
+            ):
+                if key == Qt.Key_Backspace:
+                    self._search.setFocus()
+                    self._search.backspace()
+                    return True
+                typed = event.text()
+                if typed and typed.isprintable() and key != Qt.Key_Space:
+                    self._search.setFocus()
+                    self._search.insert(typed)
+                    return True
             if main_focus and key == Qt.Key_F6:
                 self.focusNextPrevChild(not bool(event.modifiers() & Qt.ShiftModifier))
                 return True
@@ -1815,7 +1904,11 @@ class ClipPanel(QWidget):
         if event.type() in (QEvent.Type.MouseMove, QEvent.Type.Leave):
             for widget in (self._list_all, self._list_fav):
                 if obj is widget.viewport():
-                    if event.type() == QEvent.Type.MouseMove and event.modifiers() & Qt.ControlModifier:
+                    if (
+                        event.type() == QEvent.Type.MouseMove
+                        and event.modifiers() & Qt.ControlModifier
+                        and event.buttons() == Qt.NoButton
+                    ):
                         self._preview_at_position(widget, event.position().toPoint())
                     elif self._preview_hover:
                         self._hide_preview_popup()
@@ -1909,8 +2002,19 @@ class ClipPanel(QWidget):
         self._set_page_index(is_fav_tab, target)
         self._refresh_lists(preserve_selection=False)
 
+    def _row_text(self, it: ClipboardItem) -> tuple[str, str]:
+        cache_key = self._item_cache_key(it)
+        cached = self._row_text_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        val = (_favorite_title(it, 150), _secondary_text(it))
+        self._row_text_cache[cache_key] = val
+        return val
+
     def _refresh_lists(self, preserve_selection: bool = True) -> None:
         fav_ids = {fid for fid, _ in self._favorites}
+        active_tab = self._tabs.currentIndex()
+        self._tab_dirty[1 - active_tab] = True
 
         def key(widget_item):
             if widget_item is None:
@@ -1921,26 +2025,27 @@ class ClipPanel(QWidget):
             value = widget_item.data(ROLE_ITEM)
             if value is None:
                 return None
-            return ("fingerprint", value._fingerprint) if value._fingerprint else self._item_cache_key(value)
+            return value.record_key
 
-        for widget, favorites in ((self._list_all, False), (self._list_fav, True)):
-            rows = self._fav_filtered if favorites else self._filtered_items
-            start = self._clamp_page_index(len(rows), favorites) * self._PAGE_SIZE
-            page = [(fid, it, True) for fid, it in rows[start:start + self._PAGE_SIZE]] if favorites else [
-                (None, it, self._fav_id_for_item(it, fav_ids) is not None)
-                for it in rows[start:start + self._PAGE_SIZE]
-            ]
-            unchanged = widget.count() == len(page) and all(
-                widget.item(index).data(ROLE_ITEM) is it
-                and widget.item(index).data(ROLE_FAV_ID) == fid
-                and bool(widget.item(index).data(ROLE_IS_FAVORITE)) == favorite
-                for index, (fid, it, favorite) in enumerate(page)
-            )
-            if unchanged:
-                if not preserve_selection and widget.count():
-                    widget.setCurrentRow(0, QItemSelectionModel.ClearAndSelect)
-                    widget.scrollToTop()
-                continue
+        widget, favorites = (self._list_fav, True) if active_tab == 1 else (self._list_all, False)
+        self._tab_dirty[active_tab] = False
+        rows = self._fav_filtered if favorites else self._filtered_items
+        start = self._clamp_page_index(len(rows), favorites) * self._PAGE_SIZE
+        page = [(fid, it, True) for fid, it in rows[start:start + self._PAGE_SIZE]] if favorites else [
+            (None, it, self._fav_id_for_item(it, fav_ids) is not None)
+            for it in rows[start:start + self._PAGE_SIZE]
+        ]
+        unchanged = widget.count() == len(page) and all(
+            widget.item(index).data(ROLE_ITEM) is it
+            and widget.item(index).data(ROLE_FAV_ID) == fid
+            and bool(widget.item(index).data(ROLE_IS_FAVORITE)) == favorite
+            for index, (fid, it, favorite) in enumerate(page)
+        )
+        if unchanged:
+            if not preserve_selection and widget.count():
+                widget.setCurrentRow(0, QItemSelectionModel.ClearAndSelect)
+                widget.scrollToTop()
+        else:
             selected = {key(item) for item in widget.selectedItems()} if preserve_selection else set()
             current_key = key(widget.currentItem()) if preserve_selection else None
             old_row = widget.currentRow() if preserve_selection else 0
@@ -1958,7 +2063,7 @@ class ClipPanel(QWidget):
                     item.setData(ROLE_ITEM, it)
                     item.setData(ROLE_FAV_ID, fid)
                     item.setData(ROLE_IS_FAVORITE, favorite)
-                    title, subtitle = _favorite_title(it, 150), _secondary_text(it)
+                    title, subtitle = self._row_text(it)
                     item.setData(ROLE_TITLE, title)
                     item.setData(ROLE_SUBTITLE, subtitle)
                     item.setData(Qt.AccessibleTextRole, title)
@@ -2023,13 +2128,11 @@ class ClipPanel(QWidget):
             return val
 
         def _matches_query(it: ClipboardItem) -> bool:
-            if q and q not in _preview_lc(it):
-                if not (it.item_type == "files" and any(q in p.lower() for p in (it.file_paths or ()))):
-                    return False
-            if cat != "all":
-                if self._item_display_type(it) != cat:
-                    return False
-            return True
+            if cat != "all" and self._item_display_type(it) != cat:
+                return False
+            if not q or q in _preview_lc(it):
+                return True
+            return it.item_type == "files" and any(q in path.lower() for path in (it.file_paths or ()))
 
         if not q and cat == "all":
             self._filtered_items = self._all_items[:]
@@ -2043,14 +2146,14 @@ class ClipPanel(QWidget):
             self._navigation.setTabText(index, title)
         self._refresh_lists(preserve_selection=not (changed or reset_selection))
 
-    def _update_preview(self) -> None:
+    def _update_preview(self, force: bool = False) -> None:
         if not self._preview_open:
             return
         item = self._item_at_current_row()
         if item is None:
             self._hide_preview_popup()
         else:
-            self._show_preview_popup(item)
+            self._show_preview_popup(item, force=force)
 
     def _render_popup_image(self) -> None:
         if self._popup_image_data is None:
@@ -2135,7 +2238,8 @@ class ClipPanel(QWidget):
             self._schedule_visual_blob_load(it)
             self._popup_image_data = None
             self._popup_image_key = None
-            self._set_image_waiting(image_label, stack, "正在加载图片…")
+            message = "图片预览不可用" if self._blob_load_failed(it) else "正在加载图片…"
+            self._set_image_waiting(image_label, stack, message)
             return
         if not it.raw_bytes:
             self._popup_image_data = None
@@ -2171,7 +2275,9 @@ class ClipPanel(QWidget):
         y = max(area.top(), min(y, area.bottom() + 1 - height))
         self._preview_popup.move(x, y)
 
-    def _show_preview_popup(self, item: ClipboardItem) -> None:
+    def _show_preview_popup(self, item: ClipboardItem, force: bool = False) -> None:
+        if not force and self._preview_popup.isVisible() and self._popup_item is item and not item.needs_blob_load:
+            return
         self._popup_item = item
         area = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
         width = min(520 if item.item_type == "image" else 440, area.width())
@@ -2244,8 +2350,9 @@ class ClipPanel(QWidget):
         it = self._item_at_current_row()
         if it is None:
             return
-        self._on_activate(it, paste_override)
-        self.hide()
+        should_hide = self._on_activate(it, paste_override)
+        if should_hide is not False:
+            self.hide()
 
     def _selected_history_items(self) -> list[ClipboardItem]:
         result: list[ClipboardItem] = []
@@ -2276,11 +2383,6 @@ class ClipPanel(QWidget):
         ok, msg = self._delete_items(items)
         if not ok:
             QMessageBox.warning(self, "删除失败", msg or "历史记录删除失败")
-            return
-        for item in items:
-            self._search_cache.pop(self._item_cache_key(item), None)
-        self._all_items = [item for item in self._all_items if item not in items]
-        self._apply_filter()
 
     def _current_list(self) -> QListWidget:
         return self._list_fav if self._tabs.currentIndex() == 1 else self._list_all
@@ -2400,16 +2502,18 @@ class ClipPanel(QWidget):
     def _move_favorite(self, delta: int) -> None:
         if self._tabs.currentIndex() != 1 or self._reorder_favorites is None:
             return
+        if (self._search.text() or "").strip() or self._active_category != "all":
+            return
         row = self._list_fav.currentRow()
         if row < 0:
             return
         global_row = self._page_start(True) + row
-        if global_row < 0 or global_row >= len(self._fav_filtered):
+        if global_row < 0 or global_row >= len(self._favorites):
             return
         target = global_row + delta
-        if target < 0 or target >= len(self._fav_filtered):
+        if target < 0 or target >= len(self._favorites):
             return
-        ids = [fid for fid, _ in self._fav_filtered]
+        ids = [fid for fid, _ in self._favorites]
         ids[global_row], ids[target] = ids[target], ids[global_row]
         self._reorder_favorites(ids)
         if self._get_favorites is not None:
@@ -2451,6 +2555,10 @@ class ClipPanel(QWidget):
                 break
 
     def _on_tab_changed(self) -> None:
+        idx = self._tabs.currentIndex()
+        if 0 <= idx < len(self._tab_dirty) and self._tab_dirty[idx]:
+            self._refresh_lists(preserve_selection=True)
+            return
         self._sync_tooltips()
         self._sync_pagination()
         self._update_preview()
@@ -2496,9 +2604,18 @@ class ClipPanel(QWidget):
             selected_count = len(self._selected_favorite_ids())
             act_del = menu.addAction(f"移出收藏（{selected_count} 项）")
             menu.addSeparator()
+            can_reorder = (
+                self._reorder_favorites is not None
+                and not (self._search.text() or "").strip()
+                and self._active_category == "all"
+            )
             act_top = menu.addAction("置顶")
             act_up = menu.addAction("上移")
             act_down = menu.addAction("下移")
+            for act in (act_top, act_up, act_down):
+                act.setEnabled(can_reorder)
+                if not can_reorder:
+                    act.setToolTip("清除搜索和类型筛选后可调整排序")
         else:
             act_del_history = menu.addAction("删除历史记录")
         chosen = menu.exec(widget.mapToGlobal(pos))
@@ -2524,6 +2641,7 @@ class ClipPanel(QWidget):
         if it is None or it.item_type != "text":
             return
 
+        from_favorites = self._tabs.currentIndex() == 1
         old_text = it.text or ""
         new_text = self._open_text_edit_dialog(old_text)
         if new_text is None or new_text == old_text:
@@ -2538,20 +2656,9 @@ class ClipPanel(QWidget):
             _search_index=None,
             _display_type=None,
         ).prepared()
-        ok, msg = self._edit_item(it, updated)
+        ok, msg = self._edit_item(it, updated, from_favorites)
         if not ok:
             QMessageBox.warning(self, "编辑失败", msg or "内容更新失败")
-            return
-
-        self._search_cache.pop(self._item_cache_key(it), None)
-        self._all_items = [updated if current is it or current == it else current for current in self._all_items]
-
-        if self._get_favorites is not None:
-            try:
-                self._favorites = self._get_favorites()
-            except Exception:
-                pass
-        self._apply_filter()
 
     def _open_text_edit_dialog(self, initial_text: str) -> str | None:
         dlg = QDialog(self)

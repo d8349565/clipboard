@@ -108,7 +108,8 @@ def test_capture_returns_oversized_notice_without_history_item(monkeypatch) -> N
 
     result = capture.capture_clipboard()
 
-    assert isinstance(result, capture.OversizedImageNotice)
+    assert isinstance(result, capture.OversizedClipboardNotice)
+    assert result.item_type == "image"
     assert result.size == capture.MAX_IMAGE_BYTES + 100
     assert result.limit == capture.MAX_IMAGE_BYTES
 
@@ -224,4 +225,5 @@ def test_listener_ignores_cancelled_timer_generation(monkeypatch) -> None:
     timers[0].callback(*timers[0].args)
     capture_mock.assert_not_called()
     timers[1].callback(*timers[1].args)
-    capture_mock.assert_called_once_with(hwnd=123)
+    capture_mock.assert_called_once()
+    assert capture_mock.call_args.kwargs["hwnd"] == 123
